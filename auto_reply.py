@@ -381,66 +381,63 @@ class MonitorEngine:
         if not search_edit:
             return False
 
-        # 点击搜索框并输入
+        # 先点击搜索框获得焦点
         search_edit.Click(simulateMove=False)
         time.sleep(0.1)
+
+        # 清空
         search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
         time.sleep(0.05)
-        pyperclip.copy(who)
-        time.sleep(0.05)
-        search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
+
+        # 方式1: ValuePattern.SetValue(最可靠)
+        try:
+            vp = search_edit.GetValuePattern()
+            if vp:
+                vp.SetValue(who)
+                time.sleep(0.1)
+                # 触发一下搜索过滤(发送一个key event触发list刷新)
+                search_edit.SendKeys('{End}', waitTime=0.05)
+                time.sleep(0.05)
+                search_edit.SendKeys('{Back}', waitTime=0.05)
+                # 再设置一次确保
+                time.sleep(0.1)
+                if vp.Value != who:
+                    vp.SetValue(who)
+                    time.sleep(0.1)
+                self.log('[SEARCH] ValuePattern set: {!r}'.format(vp.Value[:20]))
+        except Exception as e:
+            self.log('[SEARCH] ValuePattern失败: {}, 用剪贴板'.format(e))
+            # 方式2: 剪贴板粘贴
+            pyperclip.copy(who)
+            time.sleep(0.05)
+            search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
+
         time.sleep(0.8)
 
-        # 检查搜索结果区域是否有"群聊"/"联系人"标签(部分微信版本)
-        try:
-            left_part = FreshNav._nav_splitter()
-            if left_part:
-                left_panel = [c for c in left_part.GetChildren() if c.ClassName=='mmui::XView'][0]
-                cmv = left_panel.GroupControl(ClassName='mmui::ChatMasterView')
-                cli = cmv.GroupControl(ClassName='mmui::XView')
-                # 查找所有 Button/Text 控件, 找"群聊""联系人""聊天记录"等标签
-                def _find_tabs(ele, res):
-                    try:
-                        if ele.ControlTypeName in ('ButtonControl','TextControl','TabItemControl'):
-                            n = ele.Name or ''
-                            if any(k in n for k in ['群聊','联系人','聊天记录']):
-                                res.append(ele)
-                        for c in ele.GetChildren():
-                            _find_tabs(c, res)
-                    except: pass
-                tabs = []
-                _find_tabs(cli, tabs)
-                if tabs:
-                    self.log('[SEARCH] 找到标签: {}'.format([t.Name for t in tabs]))
-                    # 点击"群聊"或"联系人"(优先群聊)
-                    for tab in tabs:
-                        if '群聊' in (tab.Name or ''):
-                            tab.Click(simulateMove=False)
-                            time.sleep(0.2)
-                            break
-                    else:
-                        tabs[0].Click(simulateMove=False)
-                        time.sleep(0.2)
-        except Exception as e:
-            self.log('[SEARCH] 标签检测异常: {}'.format(e))
-
-        # 获取搜索结果
+        # 获取搜索过滤后的列表
         table = FreshNav.get_session_table()
         if not table:
-            try:
-                search_edit.SendKeys('{Ctrl}a{Back}')
+            self.log('[SEARCH] 搜索后无法获取会话列表')
+            try: search_edit.SendKeys('{Ctrl}a{Back}')
             except: pass
             return False
 
         items = table.GetChildren()
+
+        # 如果列表还是空的, 等一等再试
         if not items:
-            self.log('[SEARCH] 搜索无结果')
-            try:
-                search_edit.SendKeys('{Ctrl}a{Back}')
+            time.sleep(0.5)
+            table = FreshNav.get_session_table()
+            if table:
+                items = table.GetChildren()
+
+        if not items:
+            self.log('[SEARCH] 搜索结果为空, 没有对应会话')
+            try: search_edit.SendKeys('{Ctrl}a{Back}')
             except: pass
             return False
 
-        # 在搜索结果中按名称匹配
+        # 在结果列表中按名称匹配(精确 > 包含 > 第一条)
         best = None
         for item in items:
             n = item.Name.split('\n')[0]
@@ -452,11 +449,13 @@ class MonitorEngine:
                     best = item
 
         if best is None:
-            # 都不匹配就用第一个
-            best = items[0]
+            self.log('[SEARCH] 搜索结果({}条)无名称匹配: {}'.format(len(items), [i.Name.split(chr(10))[0][:20] for i in items[:5]]))
+            try: search_edit.SendKeys('{Ctrl}a{Back}')
+            except: pass
+            return False
 
         n = best.Name.split('\n')[0]
-        self.log('[SEARCH] 点击: {}'.format(n[:30]))
+        self.log('[SEARCH] 点击: {}'.format(n[:40]))
         r = best.BoundingRectangle
         mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
         time.sleep(0.2)
