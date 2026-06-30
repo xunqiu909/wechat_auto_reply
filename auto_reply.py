@@ -223,6 +223,24 @@ class FreshNav:
         return sl.ListControl(ClassName='mmui::XTableView')
 
     @staticmethod
+    def get_input_field():
+        """返回输入框 EditControl (UIA方式)"""
+        sp = FreshNav._nav_splitter()
+        if not sp: return None
+        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
+        if not rights: return None
+        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
+        cp = cd.GetFirstChildControl()
+        if cp.ClassName != 'mmui::ChatMessagePage': return None
+        split = cp.CustomControl(ClassName='mmui::XSplitterView')
+        xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
+        if not xvs: return None
+        ig = xvs[0].GroupControl(ClassName='mmui::InputView')
+        xv2 = ig.GroupControl(ClassName='mmui::XView')
+        ixv = xv2.GroupControl(ClassName='mmui::XView')
+        return ixv.EditControl(ClassName='mmui::ChatInputField')
+
+    @staticmethod
     def get_input_rect():
         sp = FreshNav._nav_splitter()
         if not sp: return None
@@ -563,21 +581,47 @@ class MonitorEngine:
         return FreshNav._nav_splitter() is not None
 
     def _send_reply(self, text):
+        # 抢焦点到微信
         focus_wechat()
-        time.sleep(0.05)
+        time.sleep(0.2)  # 等窗口真正拿到焦点
         init_com()
+
+        # 获取输入框坐标点击
         rect = FreshNav.get_input_rect()
         if not rect:
-            self.log('[SEND] 找不到输入框')
+            # 回退: 直接用 UIA 找 ChatInputField
+            self.log('[SEND] 坐标取输入框失败,尝试UIA定位')
+            try:
+                input_field = FreshNav.get_input_field()
+                if input_field:
+                    input_field.Click(simulateMove=False)
+                    time.sleep(0.1)
+                    pyperclip.copy(text)
+                    time.sleep(0.05)
+                    input_field.SendKeys('{Ctrl}v', waitTime=0.03)
+                    time.sleep(0.08)
+                    input_field.SendKeys('{Enter}', waitTime=0.03)
+                    time.sleep(0.08)
+                    self.sent_texts.add(text.strip())
+                    self.log('[SEND] 成功(UIA)')
+                    return True
+            except Exception as e:
+                self.log('[SEND] UIA也失败: {}'.format(e))
             return False
+
         mouse_click((rect[0]+rect[2])//2, (rect[1]+rect[3])//2)
-        time.sleep(0.08)
+        time.sleep(0.12)
+
+        # 粘贴
         pyperclip.copy(text)
-        time.sleep(0.05)
-        uia.SendKeys('{Ctrl}v', waitTime=0.03)
         time.sleep(0.08)
-        uia.SendKeys('{Enter}', waitTime=0.03)
-        time.sleep(0.08)
+        uia.SendKeys('{Ctrl}v', waitTime=0.05)
+        time.sleep(0.12)
+
+        # 发送
+        uia.SendKeys('{Enter}', waitTime=0.05)
+        time.sleep(0.12)
+
         self.sent_texts.add(text.strip())
         self.log('[SEND] 成功')
         return True
@@ -628,16 +672,23 @@ class MonitorEngine:
         self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
 
-        # 注册全局热键 Ctrl+F12 强制停止 — 即使微信窗口在前台也有效(只注册一次)
+        # 注册全局热键 Ctrl+Shift+C 强制停止(控制台Ctrl+C也有效)
         if not hasattr(MonitorEngine, '_hotkey_hkid'):
             try:
                 _stop_self = self.stop
                 MonitorEngine._hotkey_hkid = GlobalHotkey.register(
-                    MOD_CONTROL, VK_F12, lambda: _stop_self())
+                    MOD_CONTROL | MOD_SHIFT, 0x43,  # VK_C
+                    lambda: _stop_self())
                 threading.Thread(target=GlobalHotkey.pump, daemon=True).start()
-                self.log('[HOTKEY] Ctrl+F12 已在全局注册(随时可强制停止)')
+                self.log('[HOTKEY] Ctrl+Shift+C 全局强制停止已注册')
             except Exception as e:
                 self.log('[HOTKEY] 注册失败: {}'.format(e))
+
+        # 控制台 Ctrl+C 信号处理
+        try:
+            import signal
+            signal.signal(signal.SIGINT, lambda sig, frame: self.stop())
+        except: pass
 
         if self.mode == 'loop':
             self.log('[START] 模式: 循环 | 激活{}秒/暂停{}秒 | 间隔{}秒 | 规则: {}条'.format(
