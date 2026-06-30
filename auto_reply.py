@@ -179,8 +179,9 @@ class MonitorEngine:
     def __init__(self):
         self.mode = 'once'           # 'once' | 'loop'
         self.rules = []              # [Rule, ...]
-        self.poll_interval = 3       # 轮询间隔(秒)
-        self.loop_duration = 300     # 循环模式最长运行秒数(0=无限)
+        self.poll_interval = 3       # 单次轮询间隔(秒)
+        self.active_duration = 30    # 循环模式: 每次激活持续秒数
+        self.pause_duration = 0      # 循环模式: 每次暂停秒数(0=不休)
         self.monitor_running = False
         self._thread = None
         self._lock = threading.Lock()
@@ -217,7 +218,8 @@ class MonitorEngine:
                     data = json.load(f)
                 self.mode = data.get('mode', 'once')
                 self.poll_interval = data.get('poll_interval', 3)
-                self.loop_duration = data.get('loop_duration', 300)
+                self.active_duration = data.get('active_duration', 30)
+                self.pause_duration = data.get('pause_duration', 0)
                 self.rules = [Rule.from_dict(r) for r in data.get('rules', [])]
                 self.log('已加载配置: {}模式, {} 条规则'.format(
                     '循环' if self.mode=='loop' else '单次', len(self.rules)))
@@ -232,7 +234,8 @@ class MonitorEngine:
                 json.dump({
                     'mode': self.mode,
                     'poll_interval': self.poll_interval,
-                    'loop_duration': self.loop_duration,
+                    'active_duration': self.active_duration,
+                    'pause_duration': self.pause_duration,
                     'rules': [r.to_dict() for r in self.rules],
                 }, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -259,7 +262,8 @@ class MonitorEngine:
         presets[name] = {
             'mode': self.mode,
             'poll_interval': self.poll_interval,
-            'loop_duration': self.loop_duration,
+            'active_duration': self.active_duration,
+            'pause_duration': self.pause_duration,
             'rules': [r.to_dict() for r in self.rules],
         }
         self.save_presets(presets)
@@ -272,7 +276,8 @@ class MonitorEngine:
         p = presets[name]
         self.mode = p.get('mode', 'once')
         self.poll_interval = p.get('poll_interval', 3)
-        self.loop_duration = p.get('loop_duration', 300)
+        self.active_duration = p.get('active_duration', 30)
+        self.pause_duration = p.get('pause_duration', 0)
         self.rules = [Rule.from_dict(r) for r in p.get('rules', [])]
         self.save_config()
         self.log('加载预设: {} ({}模式, {}条规则)'.format(name,
@@ -417,9 +422,13 @@ class MonitorEngine:
         self.monitor_running = True
         self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
-        self.log('[START] 模式: {} | 轮询间隔: {}秒 | 规则: {}条'.format(
-            self.status['mode'], self.poll_interval,
-            sum(1 for r in self.rules if r.enabled)))
+        if self.mode == 'loop':
+            self.log('[START] 模式: 循环 | 激活{}秒/暂停{}秒 | 间隔{}秒 | 规则: {}条'.format(
+                self.active_duration, self.pause_duration, self.poll_interval,
+                sum(1 for r in self.rules if r.enabled)))
+        else:
+            self.log('[START] 模式: 单次 | 规则: {}条'.format(
+                sum(1 for r in self.rules if r.enabled)))
         return True
 
     def stop(self):
@@ -460,28 +469,45 @@ class MonitorEngine:
         self._poll_all_rules(rules, is_once=True)
 
     def _loop_forever(self, start_time):
-        """循环检测: 一直轮询直到 stop_requested / 超时 / Ctrl+C"""
-        self.log('[LOOP] 循环开始，按 Ctrl+C 或点停止按钮退出')
-        if self.loop_duration > 0:
-            self.log('[LOOP] 最长运行: {}秒 ({})'.format(
-                self.loop_duration,
-                time.strftime('%H:%M:%S', time.localtime(start_time + self.loop_duration))))
+        """循环检测: 激活N秒 → 暂停N秒 → 重复，直到手动停止"""
+        active_dur = self.active_duration
+        pause_dur = self.pause_duration
+        self.log('[LOOP] 激活{}秒 / 暂停{}秒 循环中...'.format(active_dur, pause_dur))
 
+        cycle = 0
         while not self.stop_requested:
+            cycle += 1
             rules = [r for r in self.rules if r.enabled]
-            if not rules:
+
+            # ==== 激活阶段 ====
+            phase_start = time.time()
+            self.log('[LOOP] 周期#{} 激活开始(最长{}秒)'.format(cycle, active_dur))
+
+            while not self.stop_requested:
+                elapsed = time.time() - phase_start
+                if elapsed >= active_dur:
+                    break
+
+                if not rules:
+                    remain = active_dur - elapsed
+                    time.sleep(min(self.poll_interval, remain))
+                    continue
+
+                self.status['round'] += 1
+                self.status['total_rounds'] = '-'
+                self.log('[ROUND] 第{}轮 (周期#{}, 剩余{:.0f}秒)'.format(
+                    self.status['round'], cycle, active_dur - elapsed))
+                self._poll_all_rules(rules, is_once=False)
                 time.sleep(self.poll_interval)
-                continue
 
-            if self.loop_duration > 0 and (time.time() - start_time) >= self.loop_duration:
-                self.log('[LOOP] 达到预设运行时长，自动停止')
-                break
-
-            self.status['round'] += 1
-            self.status['total_rounds'] = '-'
-            self.log('[ROUND] 第 {} 轮'.format(self.status['round']))
-            self._poll_all_rules(rules, is_once=False)
-            time.sleep(self.poll_interval)
+            # ==== 暂停阶段 ====
+            if pause_dur > 0 and not self.stop_requested:
+                self.log('[LOOP] 周期#{} 暂停{}秒'.format(cycle, pause_dur))
+                # 分小段sleep, 以便能响应stop
+                slept = 0
+                while slept < pause_dur and not self.stop_requested:
+                    time.sleep(1)
+                    slept += 1
 
     def _poll_all_rules(self, rules, is_once):
         """遍历所有规则检查并回复"""
@@ -674,18 +700,24 @@ class AutoReplyUI:
         # 循环参数 (仅在loop模式显示)
         self.loop_params_frame = tk.Frame(mode_bar, bg='#34495e')
         self.loop_params_frame.pack(side=tk.LEFT, padx=20)
-        tk.Label(self.loop_params_frame, text='间隔(秒):', bg='#34495e', fg='white',
+        tk.Label(self.loop_params_frame, text='激活(秒):', bg='#34495e', fg='white',
                  font=('Microsoft YaHei', 9)).pack(side=tk.LEFT)
+        self.entry_active = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
+                                      width=4, relief=tk.SOLID, bd=1)
+        self.entry_active.pack(side=tk.LEFT, padx=2)
+        self.entry_active.insert(0, str(self.engine.active_duration))
+        tk.Label(self.loop_params_frame, text='暂停(秒):', bg='#34495e', fg='white',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
+        self.entry_pause = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
+                                     width=4, relief=tk.SOLID, bd=1)
+        self.entry_pause.pack(side=tk.LEFT, padx=2)
+        self.entry_pause.insert(0, str(self.engine.pause_duration))
+        tk.Label(self.loop_params_frame, text='间隔(秒):', bg='#34495e', fg='white',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
         self.entry_interval = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
                                        width=4, relief=tk.SOLID, bd=1)
         self.entry_interval.pack(side=tk.LEFT, padx=2)
         self.entry_interval.insert(0, str(self.engine.poll_interval))
-        tk.Label(self.loop_params_frame, text='最长(秒,0=无限):', bg='#34495e', fg='white',
-                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
-        self.entry_duration = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
-                                       width=5, relief=tk.SOLID, bd=1)
-        self.entry_duration.pack(side=tk.LEFT, padx=2)
-        self.entry_duration.insert(0, str(self.engine.loop_duration))
         tk.Button(self.loop_params_frame, text='应用', command=self._apply_loop_params,
                   bg='#3498db', fg='white', font=('Microsoft YaHei', 8),
                   relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=5)
@@ -815,19 +847,15 @@ class AutoReplyUI:
                                         bg='#2980b9', fg='white',
                                         font=('Microsoft YaHei', 10, 'bold'),
                                         relief=tk.FLAT, padx=12, pady=5)
-        self.btn_start_once.pack(side=tk.LEFT, padx=3)
-
         self.btn_start_loop = tk.Button(ctrl, text='  循环检测  ', command=self._start_loop,
                                         bg='#27ae60', fg='white',
                                         font=('Microsoft YaHei', 10, 'bold'),
                                         relief=tk.FLAT, padx=12, pady=5)
-        self.btn_start_loop.pack(side=tk.LEFT, padx=3)
 
         self.btn_stop = tk.Button(ctrl, text='  停止  ', command=self._stop,
                                   bg='#e74c3c', fg='white',
                                   font=('Microsoft YaHei', 10, 'bold'),
                                   relief=tk.FLAT, padx=12, pady=5, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=3)
 
         self.led = tk.Label(ctrl, text='O 已停止', font=('Microsoft YaHei', 10, 'bold'),
                             bg='#f0f0f0', fg='#e74c3c')
@@ -837,11 +865,14 @@ class AutoReplyUI:
                                     font=('Microsoft YaHei', 9), bg='#f0f0f0', fg='#555')
         self.round_label.pack(side=tk.LEFT, padx=10)
 
+        # 根据当前模式只显示对应按钮
+        self._update_start_button()
+
         # 日志
         lgf = tk.LabelFrame(bottom, text=' 运行日志 ', font=('Microsoft YaHei', 9),
                            bg='#f0f0f0', padx=3, pady=3)
         lgf.pack(fill=tk.BOTH, expand=True)
-        self.log_text = st.ScrolledText(
+        self.log_text = self.scrolledtext.ScrolledText(
             lgf, font=('Consolas', 9), height=10, relief=tk.SOLID, bd=1,
             wrap=tk.WORD, bg='#1e1e1e', fg='#d4d4d4')
         self.log_text.pack(fill=tk.BOTH, expand=True)
@@ -877,10 +908,12 @@ class AutoReplyUI:
     def _refresh_all(self):
         self._refresh_rules_tree()
         self.mode_var.set(self.engine.mode)
+        self.entry_active.delete(0, self.tk.END)
+        self.entry_active.insert(0, str(self.engine.active_duration))
+        self.entry_pause.delete(0, self.tk.END)
+        self.entry_pause.insert(0, str(self.engine.pause_duration))
         self.entry_interval.delete(0, self.tk.END)
         self.entry_interval.insert(0, str(self.engine.poll_interval))
-        self.entry_duration.delete(0, self.tk.END)
-        self.entry_duration.insert(0, str(self.engine.loop_duration))
         self._update_hint()
         self._update_loop_params_visibility()
 
@@ -890,13 +923,47 @@ class AutoReplyUI:
         else:
             self.loop_params_frame.pack_forget()
 
+    def _update_start_button(self):
+        """根据当前模式只显示对应的启动按钮"""
+        # 先都隐藏
+        self.btn_start_once.pack_forget()
+        self.btn_start_loop.pack_forget()
+        self.btn_stop.pack_forget()
+        self.led.pack_forget()
+        self.round_label.pack_forget()
+
+        # 只显示当前模式的启动按钮
+        if self.engine.mode == 'loop':
+            self.btn_start_loop.pack(side=self.tk.LEFT, padx=3)
+        else:
+            self.btn_start_once.pack(side=self.tk.LEFT, padx=3)
+
+        self.btn_stop.pack(side=self.tk.LEFT, padx=3)
+        self.led.pack(side=self.tk.LEFT, padx=15)
+        self.round_label.pack(side=self.tk.LEFT, padx=10)
+
     def _on_mode_change(self):
         self.engine.mode = self.mode_var.get()
         self.engine.save_config()
         self._update_loop_params_visibility()
-        self.log('[MODE] 切换至: {}'.format('循环检测' if self.engine.mode=='loop' else '检测一次'))
+        self._update_start_button()
+        self.engine.log('[MODE] 切换至: {}'.format('循环检测' if self.engine.mode=='loop' else '检测一次'))
 
     def _apply_loop_params(self):
+        try:
+            a = int(self.entry_active.get().strip())
+            if a < 1: raise ValueError
+            self.engine.active_duration = a
+        except:
+            self.messagebox.showwarning('错误', '激活时长必须是 >=1 的整数')
+            return
+        try:
+            p = int(self.entry_pause.get().strip())
+            if p < 0: raise ValueError
+            self.engine.pause_duration = p
+        except:
+            self.messagebox.showwarning('错误', '暂停时长必须是 >=0 的整数')
+            return
         try:
             v = int(self.entry_interval.get().strip())
             if v < 1: raise ValueError
@@ -904,15 +971,8 @@ class AutoReplyUI:
         except:
             self.messagebox.showwarning('错误', '间隔必须是 >=1 的整数')
             return
-        try:
-            d = int(self.entry_duration.get().strip())
-            if d < 0: raise ValueError
-            self.engine.loop_duration = d
-        except:
-            self.messagebox.showwarning('错误', '最长运行时间必须是 >=0 的整数')
-            return
         self.engine.save_config()
-        self.log('[CONFIG] 间隔={}秒 最长={}秒'.format(v, d))
+        self.engine.log('[CONFIG] 激活{}秒/暂停{}秒 间隔{}秒'.format(a, p, v))
 
     def _on_tree_select(self, event):
         sel = self.rules_tree.selection()
@@ -1002,13 +1062,17 @@ class AutoReplyUI:
         self._set_ui_stopped()
 
     def _set_ui_running(self):
-        self.btn_start_once.config(state=self.tk.DISABLED)
-        self.btn_start_loop.config(state=self.tk.DISABLED)
+        if self.engine.mode == 'loop':
+            self.btn_start_loop.config(state=self.tk.DISABLED)
+        else:
+            self.btn_start_once.config(state=self.tk.DISABLED)
         self.btn_stop.config(state=self.tk.NORMAL)
 
     def _set_ui_stopped(self):
-        self.btn_start_once.config(state=self.tk.NORMAL)
-        self.btn_start_loop.config(state=self.tk.NORMAL)
+        if self.engine.mode == 'loop':
+            self.btn_start_loop.config(state=self.tk.NORMAL)
+        else:
+            self.btn_start_once.config(state=self.tk.NORMAL)
         self.btn_stop.config(state=self.tk.DISABLED)
 
     def _save_preset(self):
