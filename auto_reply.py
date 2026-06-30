@@ -103,6 +103,7 @@ def init_com():
         pass
 
 def focus_wechat():
+    """强制激活微信窗口 — 无论当前在哪个窗口"""
     hwnd = win32gui.FindWindow(None, '微信')
     if not hwnd:
         hwnd = win32gui.FindWindow('mmui::MainWindow', None)
@@ -114,9 +115,20 @@ def focus_wechat():
             return True
         win32gui.EnumWindows(cb, None)
         if r: hwnd = r[0]
-    if hwnd:
-        try: win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-        except: pass
+    if not hwnd:
+        return 0
+
+    # 最小化则恢复
+    if win32gui.IsIconic(hwnd):
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    # 强制置顶
+    win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+    # 移除置顶(避免一直挡住)
+    win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                          win32con.SWP_NOMOVE | win32con.SWP_NOSIZE)
+    win32gui.SetForegroundWindow(hwnd)
+    time.sleep(0.08)
     return hwnd
 
 def mouse_click(x, y):
@@ -549,6 +561,8 @@ class MonitorEngine:
         return FreshNav._nav_splitter() is not None
 
     def _send_reply(self, text):
+        focus_wechat()
+        time.sleep(0.05)
         init_com()
         rect = FreshNav.get_input_rect()
         if not rect:
@@ -645,6 +659,8 @@ class MonitorEngine:
             self.mode = 'once'
 
     def _runner(self):
+        focus_wechat()
+        time.sleep(0.15)
         init_com()
         uia.SetGlobalSearchTimeout(3)
         self._validate_mode()
@@ -724,7 +740,9 @@ class MonitorEngine:
                 continue
             time.sleep(0.1)
 
-            # 2. 取最新一条 incoming
+            # 2. 取最新一条 incoming (先确保微信前台)
+            focus_wechat()
+            time.sleep(0.05)
             cur_name, items = FreshNav.get_message_items()
             if not cur_name or cur_name.strip() != chat.strip():
                 self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
