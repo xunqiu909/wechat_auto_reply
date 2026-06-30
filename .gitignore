@@ -1,0 +1,13 @@
+wxauto_logs
+wxauto文件下载
+dist/
+build/
+*.egg-info/
+msgs.txt
+__pycache__/
+*.ipynb
+*.bat
+@AutomationLog.txt
+auto_reply_config.json
+test_*.py
+explore_*.py
