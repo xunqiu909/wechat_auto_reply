@@ -575,94 +575,96 @@ class MonitorEngine:
                     slept += 1
 
     def _poll_all_rules(self, rules, is_once):
-        """遍历所有规则检查并回复"""
-        last_chat = None
+        """按聊天分组遍历: 每个聊天只打开一次, 取一次消息快照, 所有规则共用"""
+        # 按聊天分组
+        grouped = {}  # {chat: [(idx, rule), ...]}
         for idx, rule in enumerate(rules):
-            if self.stop_requested: break
-            skip_open = (last_chat == rule.chat)
-            self._process_rule(rule, idx, is_once, skip_open)
-            last_chat = rule.chat
+            grouped.setdefault(rule.chat, []).append((idx, rule))
 
-    def _process_rule(self, rule, idx, is_once, skip_open=False):
-        """处理单条规则 — 遍历消息找匹配并回复"""
-        # 1. 打开聊天
-        if not skip_open:
-            if not self._open_chat(rule.chat):
-                self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, rule.chat))
+        for chat, rule_list in grouped.items():
+            if self.stop_requested: break
+
+            # 打开聊天(一次)
+            if not self._open_chat(chat):
+                for idx, _ in rule_list:
+                    self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, chat))
                 self.status['last_trigger'] = '打开聊天失败'
-                return
+                continue
             time.sleep(0.1)
 
-        # 2. 获取消息
-        cur_name, items = FreshNav.get_message_items()
-        self.status['current_chat'] = cur_name or '(无法识别)'
-        if not cur_name:
-            self.log('[CHAT] 规则#{} 无法识别当前聊天'.format(idx+1))
-            return
-        if cur_name.strip() != rule.chat.strip():
-            self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(rule.chat, cur_name))
-            return
-
-        # 3. 初始化去重
-        ck = rule.chat
-        if ck not in self.replied_hashes: self.replied_hashes[ck] = set()
-        replied = self.replied_hashes[ck]
-
-        # 4. 只检查最新一条 incoming 消息
-        # 反转列表从尾部(最新)往前找第一条 incoming 文本
-        latest = None
-        for item in reversed(list(items)):
-            if self.stop_requested: break
-            msg = RawMsg(item)
-            if msg.is_timestamp or not msg.name.strip():
+            # 获取消息快照(一次)
+            cur_name, items = FreshNav.get_message_items()
+            self.status['current_chat'] = cur_name or '(无法识别)'
+            if not cur_name or cur_name.strip() != chat.strip():
+                for idx, _ in rule_list:
+                    self.log('[SKIP] 规则#{} 聊天不匹配: 期望[{}] 实际[{}]'.format(idx+1, chat, cur_name))
                 continue
-            if self._is_self(msg.name):
-                continue
-            latest = msg
-            break
 
-        if latest is None:
-            return  # 没有 incoming 消息
+            # 初始化去重(共用)
+            if chat not in self.replied_hashes:
+                self.replied_hashes[chat] = set()
+            replied = self.replied_hashes[chat]
 
-        msg = latest
-        self.status['last_message'] = msg.name[:60]
-        self.log('[POLL] incoming: {!r}'.format(msg.name[:60]))
+            # 从最新消息快照中提取所有 incoming 消息(逆序)
+            incoming_msgs = []
+            for item in reversed(list(items)):
+                msg = RawMsg(item)
+                if msg.is_timestamp or not msg.name.strip():
+                    continue
+                if self._is_self(msg.name):
+                    continue
+                incoming_msgs.append(msg)
 
-        # 4a. 去重: 同一 runtime_id 不重复回复(同一条消息不回复两次)
-        # 用 runtime_id 而非 content_hash, 确保对方"再发一次123"时能再次触发
-        if msg.runtime_id in replied:
-            self.log('[DEDUP] 已回复过 rid={} -> SKIP'.format(msg.runtime_id[:16]))
-            return
-        self.log('[DEDUP] new=True rid={}'.format(msg.runtime_id[:16]))
+            # 对每条规则测试这个快照
+            for idx, rule in rule_list:
+                if self.stop_requested: break
+                if not incoming_msgs:
+                    self.log('[POLL] 规则#{} 聊天: {} 无 incoming 消息'.format(idx+1, chat))
+                    continue
 
-        # 4b. 关键词匹配
-        if not self._match_kw(msg.name, rule.keyword):
-            self.log('[MATCH] kw={!r} msg={!r} -> False'.format(rule.keyword, self._normalize(msg.name)[:25]))
-            return
-        self.log('[MATCH] kw={!r} msg={!r} -> True'.format(rule.keyword, self._normalize(msg.name)[:25]))
+                # 取最新 incoming
+                msg = incoming_msgs[0]
+                self.status['last_message'] = msg.name[:60]
+                self.log('[POLL] 规则#{} 聊天: {} incoming: {!r}'.format(idx+1, chat, msg.name[:60]))
 
-        # 4c. 回复内容非空
-        if not rule.reply.strip():
-            self.log('[SKIP] 回复内容为空')
-            self.status['last_trigger'] = '回复内容为空'
-            return
+                # 去重(同快照内同 rid 不重复回复)
+                if msg.runtime_id in replied:
+                    self.log('[DEDUP] 已回复过 rid={} -> SKIP'.format(msg.runtime_id[:16]))
+                    continue
+                self.log('[DEDUP] new=True rid={}'.format(msg.runtime_id[:16]))
 
-        # 4d. 防循环
-        if rule.reply.strip() in msg.name:
-            self.log('[SKIP] 防循环: {!r} 已在消息中'.format(rule.reply[:20]))
-            return
+                # 关键词匹配
+                if not self._match_kw(msg.name, rule.keyword):
+                    self.log('[MATCH] kw={!r} msg={!r} -> False'.format(rule.keyword, self._normalize(msg.name)[:25]))
+                    continue
+                self.log('[MATCH] kw={!r} msg={!r} -> True'.format(rule.keyword, self._normalize(msg.name)[:25]))
 
-        # 4e. 触发 & 回复
-        self.log('[KEYWORD] 触发! [{}] kw={!r} msg={!r}'.format(rule.chat, rule.keyword, msg.name[:40]))
-        self.status['last_trigger'] = '成功: {} | {}'.format(rule.chat, rule.keyword)
+                # 回复内容非空
+                if not rule.reply.strip():
+                    self.log('[SKIP] 回复内容为空')
+                    self.status['last_trigger'] = '回复内容为空'
+                    continue
 
-        ok = self._send_reply(rule.reply)
-        self.status['last_send'] = '成功' if ok else '失败'
-        if ok:
-            self.log('[REPLY] -> [{}]: {}'.format(rule.chat, rule.reply[:40]))
-        replied.add(msg.runtime_id)
-        if len(replied) > 300:
-            self.replied_hashes[ck] = set(list(replied)[-150:])
+                # 防循环
+                if rule.reply.strip() in msg.name:
+                    self.log('[SKIP] 防循环: {!r} 已在消息中'.format(rule.reply[:20]))
+                    continue
+
+                # 触发!
+                self.log('[KEYWORD] 触发! [{}] kw={!r} msg={!r}'.format(chat, rule.keyword, msg.name[:40]))
+                self.status['last_trigger'] = '成功: {} | {}'.format(chat, rule.keyword)
+                self.status['last_match_task'] = '规则#{}: {} | {}'.format(idx+1, chat, rule.keyword)
+
+                ok = self._send_reply(rule.reply)
+                self.status['last_send'] = '成功' if ok else '失败'
+                if ok:
+                    self.log('[REPLY] -> [{}]: {}'.format(chat, rule.reply[:40]))
+                replied.add(msg.runtime_id)
+                if len(replied) > 300:
+                    self.replied_hashes[chat] = set(list(replied)[-150:])
+
+                # 一条消息只匹配一次(即使同一聊天多条规则, 只回复第一条匹配的)
+                break
 
 
 # ==================== Tkinter UI ====================
