@@ -323,13 +323,20 @@ class MonitorEngine:
         init_com()
         uia.SetGlobalSearchTimeout(3)
 
-        # 快速路径: 检查当前是否已经在目标聊天
-        cur, _ = FreshNav.get_message_items()
-        if cur and cur.strip() == who.strip():
+        # 快速路径: 从status检查当前是否已经在目标聊天
+        if self.status.get('current_chat', '') == who:
             return True
 
+        # 真正UIA快速检查(仅查当前聊天名,不取消息列表)
+        try:
+            cur_name, _ = FreshNav.get_message_items()
+            if cur_name and cur_name.strip() == who.strip():
+                self.status['current_chat'] = cur_name
+                return True
+        except: pass
+
         focus_wechat()
-        time.sleep(0.08)
+        time.sleep(0.05)
 
         # 先在可见列表中快速查找
         table = FreshNav.get_session_table()
@@ -497,20 +504,16 @@ class MonitorEngine:
 
             while not self.stop_requested:
                 elapsed = time.time() - phase_start
-                if elapsed >= active_dur:
-                    break
+                if elapsed >= active_dur: break
 
                 if not rules:
-                    remain = active_dur - elapsed
-                    time.sleep(min(self.poll_interval, remain))
+                    time.sleep(0.3)
                     continue
 
                 self.status['round'] += 1
                 self.status['total_rounds'] = '-'
-                self.log('[ROUND] 第{}轮 (周期#{}, 剩余{:.0f}秒)'.format(
-                    self.status['round'], cycle, active_dur - elapsed))
                 self._poll_all_rules(rules, is_once=False)
-                time.sleep(self.poll_interval)
+                time.sleep(max(self.poll_interval, 0.1))  # 最少100ms防止空转
 
             # ==== 暂停阶段 ====
             if pause_dur > 0 and not self.stop_requested:
@@ -525,22 +528,20 @@ class MonitorEngine:
         """遍历所有规则检查并回复"""
         last_chat = None
         for idx, rule in enumerate(rules):
-            if self.stop_requested:
-                break
-            # 如果和上一条规则目标相同，跳过重复打开
+            if self.stop_requested: break
             skip_open = (last_chat == rule.chat)
             self._process_rule(rule, idx, is_once, skip_open)
             last_chat = rule.chat
 
     def _process_rule(self, rule, idx, is_once, skip_open=False):
-        """处理单条规则"""
-        # 1. 打开聊天 (如果同聊天可跳过)
+        """处理单条规则 — 遍历消息找匹配并回复"""
+        # 1. 打开聊天
         if not skip_open:
             if not self._open_chat(rule.chat):
                 self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, rule.chat))
                 self.status['last_trigger'] = '打开聊天失败'
                 return
-            time.sleep(0.2)
+            time.sleep(0.1)
 
         # 2. 获取消息
         cur_name, items = FreshNav.get_message_items()
@@ -548,100 +549,70 @@ class MonitorEngine:
         if not cur_name:
             self.log('[CHAT] 规则#{} 无法识别当前聊天'.format(idx+1))
             return
-
-        self.log('[POLL] 规则#{} 聊天: {}'.format(idx+1, cur_name))
-
-        # 3. 聊天名匹配
         if cur_name.strip() != rule.chat.strip():
             self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(rule.chat, cur_name))
             return
 
-        # 4. 去重初始化
-        if rule.chat not in self.baseline_ids:
-            self.baseline_ids[rule.chat] = set()
-        if rule.chat not in self.replied_hashes:
-            self.replied_hashes[rule.chat] = set()
-        baseline = self.baseline_ids[rule.chat]
-        replied = self.replied_hashes[rule.chat]
+        # 3. 初始化去重
+        ck = rule.chat
+        if ck not in self.replied_hashes: self.replied_hashes[ck] = set()
+        replied = self.replied_hashes[ck]
 
-        # 单次模式: 不建基线, 直接匹配当前可见最新消息
-        # 循环模式: 首次建基线
-        is_first_loop = (self.mode == 'loop' and len(baseline) == 0)
-        if is_first_loop:
-            for item in items:
-                try: baseline.add(''.join(str(i) for i in item.GetRuntimeId()))
-                except: pass
-            self.log('[BASELINE] {} : {} 条消息加入基线'.format(rule.chat, len(baseline)))
-            return
-
-        # 5. 遍历消息
-        for item in items:
+        # 4. 只检查最新一条 incoming 消息
+        # 反转列表从尾部(最新)往前找第一条 incoming 文本
+        latest = None
+        for item in reversed(list(items)):
             if self.stop_requested: break
             msg = RawMsg(item)
             if msg.is_timestamp or not msg.name.strip():
                 continue
-
-            self.status['last_message'] = msg.name[:60]
-
-            # 方向
             if self._is_self(msg.name):
-                self.log('[POLL] 方向: outgoing (自己) -> SKIP')
                 continue
+            latest = msg
+            break
 
-            self.log('[POLL] 方向: incoming 内容: {!r}'.format(msg.name[:60]))
+        if latest is None:
+            return  # 没有 incoming 消息
 
-            # 去重
-            if is_once:
-                # 单次模式: 检查是否已回复过(跨聊天切换时防重)
-                ch = msg.content_hash
-                if ch in replied:
-                    self.log('[DEDUP] 已回复过 -> SKIP')
-                    continue
-            else:
-                if msg.runtime_id in baseline:
-                    continue
-                ch = msg.content_hash
-                if ch in replied:
-                    continue
-            self.log('[DEDUP] new=True')
+        msg = latest
+        self.status['last_message'] = msg.name[:60]
+        self.log('[POLL] incoming: {!r}'.format(msg.name[:60]))
 
-            # 关键词匹配
-            if not self._match_kw(msg.name, rule.keyword):
-                self.log('[MATCH] keyword={!r} result=False'.format(rule.keyword))
-                continue
+        # 4a. 去重: 同一 runtime_id 不重复回复(同一条消息不回复两次)
+        # 用 runtime_id 而非 content_hash, 确保对方"再发一次123"时能再次触发
+        if msg.runtime_id in replied:
+            self.log('[DEDUP] 已回复过 rid={} -> SKIP'.format(msg.runtime_id[:16]))
+            return
+        self.log('[DEDUP] new=True rid={}'.format(msg.runtime_id[:16]))
 
-            self.log('[MATCH] keyword={!r} result=True'.format(rule.keyword))
+        # 4b. 关键词匹配
+        if not self._match_kw(msg.name, rule.keyword):
+            self.log('[MATCH] kw={!r} msg={!r} -> False'.format(rule.keyword, self._normalize(msg.name)[:25]))
+            return
+        self.log('[MATCH] kw={!r} msg={!r} -> True'.format(rule.keyword, self._normalize(msg.name)[:25]))
 
-            # 检查回复内容
-            if not rule.reply.strip():
-                self.log('[SKIP] 回复内容为空')
-                self.status['last_trigger'] = '回复内容为空'
-                continue
+        # 4c. 回复内容非空
+        if not rule.reply.strip():
+            self.log('[SKIP] 回复内容为空')
+            self.status['last_trigger'] = '回复内容为空'
+            return
 
-            # 防循环
-            if rule.reply.strip() in msg.name:
-                self.log('[SKIP] 防循环: 回复内容已在消息中')
-                continue
+        # 4d. 防循环
+        if rule.reply.strip() in msg.name:
+            self.log('[SKIP] 防循环: {!r} 已在消息中'.format(rule.reply[:20]))
+            return
 
-            # 触发!
-            self.log('[KEYWORD] 触发! [{}] kw={!r} msg={!r}'.format(
-                rule.chat, rule.keyword, msg.name[:40]))
-            self.status['last_trigger'] = '成功: {} | {}'.format(rule.chat, rule.keyword)
+        # 4e. 触发 & 回复
+        self.log('[KEYWORD] 触发! [{}] kw={!r} msg={!r}'.format(rule.chat, rule.keyword, msg.name[:40]))
+        self.status['last_trigger'] = '成功: {} | {}'.format(rule.chat, rule.keyword)
 
-            ok = self._send_reply(rule.reply)
-            self.status['last_send'] = '成功' if ok else '失败'
-            if ok:
-                self.log('[REPLY] -> [{}]: {}'.format(rule.chat, rule.reply[:40]))
-            replied.add(ch)
-            if len(replied) > 200:
-                self.replied_hashes[rule.chat] = set(list(replied)[-100:])
-            break  # 每条规则每轮最多回复一次
-
-        # 更新基线
-        if self.mode == 'loop':
-            for item in items:
-                try: baseline.add(''.join(str(i) for i in item.GetRuntimeId()))
-                except: pass
+        ok = self._send_reply(rule.reply)
+        self.status['last_send'] = '成功' if ok else '失败'
+        if ok:
+            self.log('[REPLY] -> [{}]: {}'.format(rule.chat, rule.reply[:40]))
+        replied.add(msg.runtime_id)
+        if len(replied) > 300:
+            self.replied_hashes[ck] = set(list(replied)[-150:])
 
 
 # ==================== Tkinter UI ====================
