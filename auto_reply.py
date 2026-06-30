@@ -651,36 +651,45 @@ class MonitorEngine:
                 self.log('[POLL] 聊天: {} 无消息'.format(chat))
                 continue
 
-            is_self = self._is_self(latest.name)
+            # 解析发送人 (群聊: "sender_id\ncontent", 单聊: 纯 "content")
+            full = latest.name
+            sender = ''
+            content = full
+            if '\n' in full and len(full.split('\n')[0]) < 30:
+                parts = full.split('\n', 1)
+                sender = parts[0]
+                content = parts[1] if len(parts) > 1 else full
+
+            is_self = self._is_self(full)
             if is_self:
-                self.log('[POLL] 聊天: {} 最后消息: {!r} (自己)'.format(chat, latest.name[:50]))
+                self.log('[POLL] 聊天: {} 最后消息: {!r} (自己)'.format(chat, full[:50]))
+            elif sender:
+                self.log('[POLL] 聊天: {} 发送人:{} 最后消息: {!r}'.format(chat, sender, content[:50]))
             else:
-                self.log('[POLL] 聊天: {} 最后消息: {!r}'.format(chat, latest.name[:60]))
+                self.log('[POLL] 聊天: {} 最后消息: {!r}'.format(chat, content[:60]))
 
-            # 3. 和上次相同→跳过
+            # 3. 和上次相同(聊天+发送人+文本) → 跳过
+            dedup_key = '{}|{}|{}'.format(chat, sender, content.strip())
             prev = self.last_incoming.get(chat, '')
-            cur_text = latest.name.strip()
-            if cur_text == prev:
-                self.log('[DEDUP] 最后消息未变 {!r} -> SKIP'.format(prev[:30]))
+            if dedup_key == prev:
+                self.log('[DEDUP] 最后消息未变 ({}) -> SKIP'.format(prev[:40]))
                 continue
-
-            # 更新基准(自己发的也更新, 下次只检测新消息)
-            self.last_incoming[chat] = cur_text
+            self.last_incoming[chat] = dedup_key
 
             self.status['current_chat'] = chat
-            self.status['last_message'] = cur_text[:60]
+            self.status['last_message'] = content[:60]
 
             # 4. 自己发的不触发规则, 但已刷新去重
             if is_self:
                 continue
 
-            # 5. 逐条规则匹配, 命中第一条即回复并停止
+            # 5. 逐条规则匹配(对 content 做关键词匹配)
             for idx, rule in rule_list:
-                if not self._match_kw(latest.name, rule.keyword):
+                if not self._match_kw(content, rule.keyword):
                     continue
                 if not rule.reply.strip():
                     continue
-                if rule.reply.strip() in latest.name:
+                if rule.reply.strip() in full:
                     self.log('[SKIP] 防循环: {!r}'.format(rule.reply[:20]))
                     continue
 
