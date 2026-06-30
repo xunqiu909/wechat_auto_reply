@@ -12,7 +12,7 @@ from auto_reply import MonitorEngine, AutoReplyUI
 
 
 def main():
-    engine = MonitorEngine(poll_interval=3)
+    engine = MonitorEngine()
     ui = AutoReplyUI(engine)
     ui.build_and_run()
 

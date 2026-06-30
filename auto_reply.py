@@ -1,9 +1,11 @@
 """
-wxauto 4.1 自动回复监控系统 v3
+wxauto 4.1 自动回复监控系统 v4
 --------------------------------
-键盘+UIA混合方案，完整日志链路，方向检测，去重，防循环
+模式: 检测一次 / 循环检测
+多规则: 每规则独立 (聊天+关键词+回复)
+预设: 保存/加载/删除 配置快照
 """
-import sys, os, json, re, time, threading, queue, hashlib
+import sys, os, json, time, threading, queue, hashlib, copy
 from datetime import datetime
 
 import pyperclip
@@ -11,7 +13,7 @@ import win32gui, win32con, win32api
 import uiautomation as uia
 
 
-# ==================== COM / 工具 ====================
+# ==================== COM / 底层工具 ====================
 
 def init_com():
     try:
@@ -48,199 +50,177 @@ def get_hwnd():
     return win32gui.FindWindow(None, '微信') or win32gui.FindWindow('mmui::MainWindow', None)
 
 
-# ==================== UIA 导航(每次从HWND重建) ====================
+# ==================== UIA 导航 ====================
 
 class FreshNav:
-    """每次调用都从 HWND 全新建立 UIA 树, 杜绝stale引用"""
-
     @staticmethod
     def _win():
         h = get_hwnd()
         if not h: return None
         init_com()
-        try:
-            return uia.ControlFromHandle(h)
+        try: return uia.ControlFromHandle(h)
         except:
-            try:
-                return uia.WindowControl(ClassName='mmui::MainWindow', searchDepth=1)
-            except:
-                return None
+            try: return uia.WindowControl(ClassName='mmui::MainWindow', searchDepth=1)
+            except: return None
 
     @staticmethod
-    def _nav_to_splitter():
-        """导航到右侧 XStackedWidget 下的 XSplitterView"""
-        win = FreshNav._win()
-        if not win: return None
-        root = win.GroupControl(searchDepth=1)
-        stacked = root.CustomControl(ClassName='QStackedWidget')
-        mv = stacked.GroupControl(ClassName='mmui::MainView')
-        cws = [c for c in mv.GetChildren() if c.ClassName == 'QWidget' and c.ControlTypeName == 'GroupControl']
-        if not cws: return None
-        imv = cws[0].GroupControl(ClassName='mmui::MainView')
-        s = imv.CustomControl(ClassName='mmui::XSplitterView')
-        outer_stack = s.CustomControl(ClassName='mmui::XStackedWidget')
-        outer_splitter = outer_stack.CustomControl(ClassName='mmui::XSplitterView')
-        return outer_splitter
-
-    @staticmethod
-    def get_right_splitter():
-        """返回右侧 ChatDetailView -> 聊天页 -> XSplitterView(消息+输入)"""
-        outer = FreshNav._nav_to_splitter()
-        if not outer: return None
-        rights = [c for c in outer.GetChildren() if c.ClassName == 'mmui::XStackedWidget']
-        if not rights: return None
-        cdd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
-        chat_page = cdd.GetFirstChildControl()
-        if chat_page.ClassName != 'mmui::ChatMessagePage':
-            return None  # 没有聊天打开
-        return chat_page.CustomControl(ClassName='mmui::XSplitterView')  # 消息+输入
+    def _nav_splitter():
+        w = FreshNav._win()
+        if not w: return None
+        r = w.GroupControl(searchDepth=1)
+        s = r.CustomControl(ClassName='QStackedWidget')
+        m = s.GroupControl(ClassName='mmui::MainView')
+        cw = [c for c in m.GetChildren() if c.ClassName=='QWidget' and c.ControlTypeName=='GroupControl']
+        if not cw: return None
+        im = cw[0].GroupControl(ClassName='mmui::MainView')
+        sp = im.CustomControl(ClassName='mmui::XSplitterView')
+        os = sp.CustomControl(ClassName='mmui::XStackedWidget')
+        return os.CustomControl(ClassName='mmui::XSplitterView')
 
     @staticmethod
     def get_message_items():
-        """返回 (chat_name, [msg_items]) 或 (None, [])"""
-        outer = FreshNav._nav_to_splitter()
-        if not outer: return None, []
-        rights = [c for c in outer.GetChildren() if c.ClassName == 'mmui::XStackedWidget']
+        sp = FreshNav._nav_splitter()
+        if not sp: return None, []
+        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
         if not rights: return None, []
-        cdd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
-        chat_page = cdd.GetFirstChildControl()
-        if chat_page.ClassName != 'mmui::ChatMessagePage':
-            return None, []
-
-        # 标题栏 -> 聊天对象名
-        tb = chat_page.GetChildren()[0]
+        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
+        cp = cd.GetFirstChildControl()
+        if cp.ClassName != 'mmui::ChatMessagePage': return None, []
+        tb = cp.GetChildren()[0]
         def find_name(ele):
             try:
-                if (ele.ControlTypeName == 'TextControl' and
-                    ele.ClassName == 'mmui::XTextView'):
+                if ele.ControlTypeName=='TextControl' and ele.ClassName=='mmui::XTextView':
                     n = ele.Name or ''
-                    if n and not (n.startswith('(') and n.endswith(')')):
-                        return n
+                    if n and not (n.startswith('(') and n.endswith(')')): return n
                 for c in ele.GetChildren():
                     r = find_name(c)
                     if r: return r
             except: pass
             return None
         chat_name = find_name(tb)
-
-        # 消息区
-        splitter = chat_page.CustomControl(ClassName='mmui::XSplitterView')
-        mvs = [c for c in splitter.GetChildren() if c.ClassName == 'mmui::MessageView']
+        split = cp.CustomControl(ClassName='mmui::XSplitterView')
+        mvs = [c for c in split.GetChildren() if c.ClassName=='mmui::MessageView']
         if not mvs: return chat_name, []
-        msg_list = mvs[0].ListControl(ClassName='mmui::RecyclerListView')
-        return chat_name, msg_list.GetChildren()
+        lst = mvs[0].ListControl(ClassName='mmui::RecyclerListView')
+        return chat_name, lst.GetChildren()
 
     @staticmethod
     def get_session_table():
-        """返回会话列表 XTableView"""
-        outer = FreshNav._nav_to_splitter()
-        if not outer: return None
-        lefts = [c for c in outer.GetChildren() if c.ClassName == 'mmui::XView']
+        sp = FreshNav._nav_splitter()
+        if not sp: return None
+        lefts = [c for c in sp.GetChildren() if c.ClassName=='mmui::XView']
         if not lefts: return None
         cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
-        cli = cmv.GroupControl(ClassName='mmui::XView')
-        areas = [c for c in cli.GetChildren() if c.ClassName == 'mmui::XView']
-        if len(areas) < 2: return None
-        li = areas[1].GroupControl(ClassName='mmui::XView')
+        cl = cmv.GroupControl(ClassName='mmui::XView')
+        ar = [c for c in cl.GetChildren() if c.ClassName=='mmui::XView']
+        if len(ar)<2: return None
+        li = ar[1].GroupControl(ClassName='mmui::XView')
         sl = li.GroupControl(ClassName='mmui::ChatSessionList')
         return sl.ListControl(ClassName='mmui::XTableView')
 
     @staticmethod
     def get_input_rect():
-        """返回输入框区域坐标"""
-        splitter = FreshNav.get_right_splitter()
-        if not splitter: return None
-        xvs = [c for c in splitter.GetChildren() if c.ClassName == 'mmui::XView']
+        sp = FreshNav._nav_splitter()
+        if not sp: return None
+        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
+        if not rights: return None
+        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
+        cp = cd.GetFirstChildControl()
+        if cp.ClassName!='mmui::ChatMessagePage': return None
+        split = cp.CustomControl(ClassName='mmui::XSplitterView')
+        xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
         if not xvs: return None
         r = xvs[0].BoundingRectangle
         return (r.left, r.top, r.right, r.bottom)
 
+
+# ==================== 数据模型 ====================
+
+class Rule:
+    """单条回复规则"""
+    __slots__ = ('chat', 'keyword', 'reply', 'enabled')
+    def __init__(self, chat='', keyword='', reply='', enabled=True):
+        self.chat = chat
+        self.keyword = keyword
+        self.reply = reply
+        self.enabled = enabled
+
+    def to_dict(self):
+        return {'chat': self.chat, 'keyword': self.keyword,
+                'reply': self.reply, 'enabled': self.enabled}
+
     @staticmethod
-    def switch_to_chat_tab():
-        win = FreshNav._win()
-        if not win: return
-        root = win.GroupControl(searchDepth=1)
-        stacked = root.CustomControl(ClassName='QStackedWidget')
-        mv = stacked.GroupControl(ClassName='mmui::MainView')
-        nav = mv.ToolBarControl(ClassName='mmui::MainTabBar')
-        nav.ButtonControl(Name='微信').Click(simulateMove=False)
+    def from_dict(d):
+        return Rule(d.get('chat',''), d.get('keyword',''),
+                    d.get('reply',''), d.get('enabled',True))
 
-
-# ==================== 消息模型 ====================
 
 class RawMsg:
-    """原始消息"""
-    __slots__ = ('cls', 'name', 'runtime_id', 'rect_left', 'rect_right')
+    __slots__ = ('cls','name','runtime_id')
     def __init__(self, item):
         self.cls = item.ClassName
         self.name = item.Name or ''
-        r = item.BoundingRectangle
-        self.rect_left = r.left
-        self.rect_right = r.right
-        try:
-            self.runtime_id = ''.join(str(i) for i in item.GetRuntimeId())
-        except:
-            self.runtime_id = ''
-
+        try: self.runtime_id = ''.join(str(i) for i in item.GetRuntimeId())
+        except: self.runtime_id = ''
     @property
-    def is_timestamp(self):
-        return self.cls == 'mmui::ChatItemView'
-
+    def is_timestamp(self): return self.cls == 'mmui::ChatItemView'
     @property
-    def is_text(self):
-        return self.cls == 'mmui::ChatTextItemView'
-
+    def is_text(self): return self.cls == 'mmui::ChatTextItemView'
     @property
     def content_hash(self):
-        return hashlib.md5(self.name.encode('utf-8', errors='replace')).hexdigest()[:16]
+        return hashlib.md5(self.name.encode('utf-8','replace')).hexdigest()[:16]
 
 
 # ==================== 监控引擎 ====================
 
 class MonitorEngine:
+    """自动回复引擎 — 支持 once / loop 模式"""
 
-    def __init__(self, poll_interval=3):
-        self.tasks = {}               # {chat_name: {keywords, reply, enabled}}
-        self.monitor_running = False  # 监控是否在运行(区别于任务enabled)
+    def __init__(self):
+        self.mode = 'once'           # 'once' | 'loop'
+        self.rules = []              # [Rule, ...]
+        self.poll_interval = 3       # 轮询间隔(秒)
+        self.loop_duration = 300     # 循环模式最长运行秒数(0=无限)
+        self.monitor_running = False
         self._thread = None
         self._lock = threading.Lock()
-        self.poll_interval = poll_interval
         self.log_queue = queue.Queue()
 
-        # 去重 & 防循环
-        self.baseline_ids = {}        # {chat: set(runtime_id)}  启动时的消息基线
-        self.replied_hashes = {}      # {chat: set(content_hash)}  已回复的消息
-        self.sent_texts = set()       # 自己发过的所有文本(防循环)
+        self.baseline_ids = {}
+        self.replied_hashes = {}
+        self.sent_texts = set()
+        self.stop_requested = False  # 用于 Ctrl+C / 超时 / 手动停止
 
-        # UI 状态
         self.status = {
-            'current_chat': '',        # 最后识别的聊天
-            'last_message': '',        # 最后检测的消息
-            'last_match_task': '',     # 最后匹配的任务
-            'last_trigger_result': '', # 触发结果
-            'last_send_result': '',    # 发送结果
-            'last_skip_reason': '',    # 跳过原因
+            'mode': '检测一次', 'current_chat': '', 'last_message': '',
+            'last_trigger': '', 'last_send': '', 'round': 0, 'total_rounds': 0,
         }
 
         self.config_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), 'auto_reply_config.json')
+        self.presets_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'auto_reply_presets.json')
 
     def log(self, msg):
         t = datetime.now().strftime('%H:%M:%S')
         text = '[{}] {}'.format(t, msg)
         self.log_queue.put(text)
         try: print(text)
-        except: print(text.encode('ascii', errors='replace').decode('ascii', errors='replace'))
+        except: print(text.encode('ascii','replace').decode('ascii','replace'))
 
-    # ---- 配置 ----
+    # ---- 配置读写 ----
+
     def load_config(self):
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                self.tasks = data.get('tasks', {})
+                self.mode = data.get('mode', 'once')
                 self.poll_interval = data.get('poll_interval', 3)
-                self.log('已加载 {} 个监控任务'.format(len(self.tasks)))
+                self.loop_duration = data.get('loop_duration', 300)
+                self.rules = [Rule.from_dict(r) for r in data.get('rules', [])]
+                self.log('已加载配置: {}模式, {} 条规则'.format(
+                    '循环' if self.mode=='loop' else '单次', len(self.rules)))
                 return True
             except Exception as e:
                 self.log('加载配置失败: {}'.format(e))
@@ -249,54 +229,101 @@ class MonitorEngine:
     def save_config(self):
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump({'tasks': self.tasks, 'poll_interval': self.poll_interval},
-                          f, ensure_ascii=False, indent=2)
+                json.dump({
+                    'mode': self.mode,
+                    'poll_interval': self.poll_interval,
+                    'loop_duration': self.loop_duration,
+                    'rules': [r.to_dict() for r in self.rules],
+                }, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self.log('保存配置失败: {}'.format(e))
 
-    def add_task(self, chat_name, keywords, reply_text):
-        with self._lock:
-            if isinstance(keywords, str):
-                keywords = [k.strip() for k in keywords.split(',') if k.strip()]
-            self.tasks[chat_name] = {
-                'keywords': keywords,
-                'reply': reply_text,
-                'enabled': True
-            }
-            self.save_config()
-            self.log('添加监控: {} | {} | {}...'.format(chat_name, ','.join(keywords), reply_text[:25]))
+    # ---- 预设管理 ----
 
-    def remove_task(self, name):
-        with self._lock:
-            self.tasks.pop(name, None)
-            self.baseline_ids.pop(name, None)
-            self.replied_hashes.pop(name, None)
-            self.save_config()
-            self.log('移除监控: {}'.format(name))
+    def load_presets(self):
+        if os.path.exists(self.presets_path):
+            try:
+                with open(self.presets_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except: pass
+        return {}
 
-    def toggle_task(self, name, enabled):
+    def save_presets(self, presets):
+        try:
+            with open(self.presets_path, 'w', encoding='utf-8') as f:
+                json.dump(presets, f, ensure_ascii=False, indent=2)
+        except: pass
+
+    def save_preset(self, name):
+        presets = self.load_presets()
+        presets[name] = {
+            'mode': self.mode,
+            'poll_interval': self.poll_interval,
+            'loop_duration': self.loop_duration,
+            'rules': [r.to_dict() for r in self.rules],
+        }
+        self.save_presets(presets)
+        self.log('预设已保存: {}'.format(name))
+
+    def load_preset(self, name):
+        presets = self.load_presets()
+        if name not in presets:
+            return False
+        p = presets[name]
+        self.mode = p.get('mode', 'once')
+        self.poll_interval = p.get('poll_interval', 3)
+        self.loop_duration = p.get('loop_duration', 300)
+        self.rules = [Rule.from_dict(r) for r in p.get('rules', [])]
+        self.save_config()
+        self.log('加载预设: {} ({}模式, {}条规则)'.format(name,
+            '循环' if self.mode=='loop' else '单次', len(self.rules)))
+        return True
+
+    def delete_preset(self, name):
+        presets = self.load_presets()
+        if name in presets:
+            del presets[name]
+            self.save_presets(presets)
+            return True
+        return False
+
+    # ---- 规则 CRUD ----
+
+    def add_rule(self, chat, keyword, reply):
         with self._lock:
-            if name in self.tasks:
-                self.tasks[name]['enabled'] = enabled
+            self.rules.append(Rule(chat, keyword, reply, True))
+            self.save_config()
+            self.log('添加规则: {} | {} | {}...'.format(chat, keyword, reply[:25]))
+
+    def remove_rule(self, index):
+        with self._lock:
+            if 0 <= index < len(self.rules):
+                r = self.rules.pop(index)
                 self.save_config()
-                self.log('{}: {}'.format('启用' if enabled else '禁用', name))
+                self.log('删除规则: {} | {}'.format(r.chat, r.keyword))
+
+    def toggle_rule(self, index, enabled=None):
+        with self._lock:
+            if 0 <= index < len(self.rules):
+                if enabled is None:
+                    self.rules[index].enabled = not self.rules[index].enabled
+                else:
+                    self.rules[index].enabled = enabled
+                self.save_config()
 
     # ---- 核心操作 ----
 
     def _open_chat(self, who):
-        """打开指定会话(滚动+点击)"""
         init_com()
+        focus_wechat()
+        time.sleep(0.15)
         uia.SetGlobalSearchTimeout(3)
-
-        # 先滚到顶部
         table = FreshNav.get_session_table()
         if table:
             for _ in range(20):
                 table.WheelUp(wheelTimes=15, waitTime=0.01, interval=0.01)
                 time.sleep(0.02)
             time.sleep(0.25)
-
-        # 扫描
         seen = set()
         for direction in ['down', 'up']:
             for _ in range(12):
@@ -309,14 +336,13 @@ class MonitorEngine:
                     cur.add(n)
                     if who == n:
                         r = item.BoundingRectangle
-                        mouse_click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
                         time.sleep(0.6)
-                        if FreshNav.get_right_splitter():
+                        if FreshNav._nav_splitter():
                             return True
-                        # 重试
-                        mouse_click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
                         time.sleep(0.5)
-                        return FreshNav.get_right_splitter() is not None
+                        return FreshNav._nav_splitter() is not None
                 if cur.issubset(seen): break
                 seen.update(cur)
                 if direction == 'down':
@@ -327,305 +353,252 @@ class MonitorEngine:
         return False
 
     def _send_reply(self, text):
-        """发送回复(点击输入框 → 粘贴 → Enter)"""
         init_com()
         rect = FreshNav.get_input_rect()
         if not rect:
-            self.log('[SEND] 找不到输入框区域')
+            self.log('[SEND] 找不到输入框')
             return False
-
         self.log('[SEND] 点击输入框')
-        mouse_click((rect[0] + rect[2]) // 2, (rect[1] + rect[3]) // 2)
+        mouse_click((rect[0]+rect[2])//2, (rect[1]+rect[3])//2)
         time.sleep(0.15)
-
-        self.log('[SEND] 粘贴文本: {}'.format(text[:40]))
+        self.log('[SEND] 粘贴: {}'.format(text[:40]))
         pyperclip.copy(text)
         time.sleep(0.08)
         uia.SendKeys('{Ctrl}v', waitTime=0.05)
         time.sleep(0.15)
-
-        self.log('[SEND] 按 Enter')
         uia.SendKeys('{Enter}', waitTime=0.05)
         time.sleep(0.15)
-
-        # 记录自己发送的内容, 防止循环触发
         self.sent_texts.add(text.strip())
-        self.log('[SEND] 发送成功')
+        self.log('[SEND] 成功')
         return True
 
-    # ---- 消息方向判断 ----
-    # 一对一聊天中, UIA 无法区分左右气泡
-    # 策略: 任何在 sent_texts 中的内容 = outgoing(自己), 其余 = incoming(对方)
-
-    def _is_self_message(self, text):
-        """判断是否是自己发的消息"""
+    def _is_self(self, text):
         t = text.strip()
-        # 精确匹配
-        if t in self.sent_texts:
-            return True
-        # 模糊匹配(剪贴板可能引入空白差异)
-        for sent in self.sent_texts:
-            if sent.strip() == t:
-                return True
+        if t in self.sent_texts: return True
+        for s in self.sent_texts:
+            if s.strip() == t: return True
         return False
 
-    def _normalize(self, text):
-        """标准化文本"""
-        if not text: return ''
-        return text.strip().replace('\n', '').replace(' ', '')
+    @staticmethod
+    def _normalize(t):
+        if not t: return ''
+        return t.strip().replace('\n','').replace(' ','')
 
-    def _match_keyword(self, message_text, keyword):
-        """关键词匹配(contains_match)"""
-        if not message_text or not keyword:
-            return False
-        msg = self._normalize(message_text)
-        kw = self._normalize(keyword)
-        # contains match
-        if kw and kw in msg:
-            return True
-        # exact match
-        if msg == kw:
-            return True
-        return False
+    @staticmethod
+    def _match_kw(msg_text, keyword):
+        if not msg_text or not keyword: return False
+        m = MonitorEngine._normalize(msg_text)
+        k = MonitorEngine._normalize(keyword)
+        if not k: return False
+        return k in m or m == k
 
-    # ---- 监控循环 ----
+    # ---- 运行入口 ----
 
-    def start(self):
+    def start(self, mode=None):
+        """启动监控。mode=None使用已配置的模式"""
         if self.monitor_running:
-            self.log('[START] 监控已在运行中')
+            self.log('[START] 已在运行中')
             return False
-
-        # 确保微信在前台
+        if mode is not None:
+            self.mode = mode
+        self._validate_mode()
         focus_wechat()
         time.sleep(0.3)
-
-        # 清空历史状态
         self.baseline_ids.clear()
         self.replied_hashes.clear()
         self.sent_texts.clear()
+        self.stop_requested = False
         self.status = {
-            'current_chat': '', 'last_message': '', 'last_match_task': '',
-            'last_trigger_result': '', 'last_send_result': '', 'last_skip_reason': '',
+            'mode': '循环检测' if self.mode=='loop' else '检测一次',
+            'current_chat': '', 'last_message': '',
+            'last_trigger': '', 'last_send': '',
+            'round': 0, 'total_rounds': 0,
         }
-
         self.monitor_running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
-
-        with self._lock:
-            enabled = [n for n, c in self.tasks.items() if c.get('enabled', True)]
-        self.log('[START] 监控已启动，轮询间隔: {}秒'.format(self.poll_interval))
-        self.log('[START] 当前启用任务数: {}'.format(len(enabled)))
-        for n in enabled:
-            cfg = self.tasks[n]
-            self.log('[START] 监听聊天: {} | 触发关键词: {}'.format(n, ','.join(cfg['keywords'])))
+        self.log('[START] 模式: {} | 轮询间隔: {}秒 | 规则: {}条'.format(
+            self.status['mode'], self.poll_interval,
+            sum(1 for r in self.rules if r.enabled)))
         return True
 
     def stop(self):
-        if not self.monitor_running:
-            return
+        if not self.monitor_running: return
+        self.stop_requested = True
         self.monitor_running = False
         if self._thread:
             self._thread.join(timeout=5)
-        self.log('[STOP] 监控已停止')
+        self.log('[STOP] 监控已停止 (完成{}轮)'.format(self.status['round']))
 
-    def _build_baseline(self):
-        """把当前所有可见消息加入基线, 避免启动时误触发"""
-        with self._lock:
-            active = {n: c for n, c in self.tasks.items() if c.get('enabled', True)}
-        for chat_name in active:
-            if not self._open_chat(chat_name):
-                continue
-            time.sleep(0.4)
-            _, items = FreshNav.get_message_items()
-            if items:
-                ids = set()
-                for item in items:
-                    try:
-                        ids.add(''.join(str(i) for i in item.GetRuntimeId()))
-                    except:
-                        pass
-                self.baseline_ids[chat_name] = ids
-                self.log('[BASELINE] {} : {} 条消息加入基线'.format(chat_name, len(ids)))
+    def _validate_mode(self):
+        if self.mode not in ('once', 'loop'):
+            self.mode = 'once'
 
-    def _loop(self):
+    def _runner(self):
         init_com()
-        focus_wechat()
         uia.SetGlobalSearchTimeout(3)
+        self._validate_mode()
+        self.log('[RUN] {}模式启动'.format('循环' if self.mode=='loop' else '单次'))
+        t0 = time.time()
 
-        self.log('[LOOP] 监控循环启动')
+        if self.mode == 'once':
+            self._poll_once()
+        else:
+            self._loop_forever(t0)
 
-        while self.monitor_running:
-            try:
-                with self._lock:
-                    active = {n: c for n, c in self.tasks.items() if c.get('enabled', True)}
+        self.monitor_running = False
+        elapsed = int(time.time() - t0)
+        self.log('[END] 运行结束，耗时 {} 秒，共 {} 轮'.format(elapsed, self.status['round']))
 
-                if not active:
-                    self.status['last_skip_reason'] = '没有启用的任务'
-                    time.sleep(self.poll_interval)
+    def _poll_once(self):
+        """单次检测: 遍历所有规则一次，匹配则回复，然后停止"""
+        rules = [r for r in self.rules if r.enabled]
+        if not rules:
+            self.log('[SKIP] 没有启用的规则')
+            return
+        self.status['total_rounds'] = 1
+        self._poll_all_rules(rules, is_once=True)
+
+    def _loop_forever(self, start_time):
+        """循环检测: 一直轮询直到 stop_requested / 超时 / Ctrl+C"""
+        self.log('[LOOP] 循环开始，按 Ctrl+C 或点停止按钮退出')
+        if self.loop_duration > 0:
+            self.log('[LOOP] 最长运行: {}秒 ({})'.format(
+                self.loop_duration,
+                time.strftime('%H:%M:%S', time.localtime(start_time + self.loop_duration))))
+
+        while not self.stop_requested:
+            rules = [r for r in self.rules if r.enabled]
+            if not rules:
+                time.sleep(self.poll_interval)
+                continue
+
+            if self.loop_duration > 0 and (time.time() - start_time) >= self.loop_duration:
+                self.log('[LOOP] 达到预设运行时长，自动停止')
+                break
+
+            self.status['round'] += 1
+            self.status['total_rounds'] = '-'
+            self.log('[ROUND] 第 {} 轮'.format(self.status['round']))
+            self._poll_all_rules(rules, is_once=False)
+            time.sleep(self.poll_interval)
+
+    def _poll_all_rules(self, rules, is_once):
+        """遍历所有规则检查并回复"""
+        for idx, rule in enumerate(rules):
+            if self.stop_requested:
+                break
+            self._process_rule(rule, idx, is_once)
+
+    def _process_rule(self, rule, idx, is_once):
+        """处理单条规则"""
+        # 1. 打开聊天
+        if not self._open_chat(rule.chat):
+            self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, rule.chat))
+            self.status['last_trigger'] = '打开聊天失败'
+            return
+        time.sleep(0.4)
+
+        # 2. 获取消息
+        cur_name, items = FreshNav.get_message_items()
+        self.status['current_chat'] = cur_name or '(无法识别)'
+        if not cur_name:
+            self.log('[CHAT] 规则#{} 无法识别当前聊天'.format(idx+1))
+            return
+
+        self.log('[POLL] 规则#{} 聊天: {}'.format(idx+1, cur_name))
+
+        # 3. 聊天名匹配
+        if cur_name.strip() != rule.chat.strip():
+            self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(rule.chat, cur_name))
+            return
+
+        # 4. 去重初始化
+        if rule.chat not in self.baseline_ids:
+            self.baseline_ids[rule.chat] = set()
+        if rule.chat not in self.replied_hashes:
+            self.replied_hashes[rule.chat] = set()
+        baseline = self.baseline_ids[rule.chat]
+        replied = self.replied_hashes[rule.chat]
+
+        # 单次模式: 不建基线, 直接匹配当前可见最新消息
+        # 循环模式: 首次建基线
+        is_first_loop = (self.mode == 'loop' and len(baseline) == 0)
+        if is_first_loop:
+            for item in items:
+                try: baseline.add(''.join(str(i) for i in item.GetRuntimeId()))
+                except: pass
+            self.log('[BASELINE] {} : {} 条消息加入基线'.format(rule.chat, len(baseline)))
+            return
+
+        # 5. 遍历消息
+        for item in items:
+            if self.stop_requested: break
+            msg = RawMsg(item)
+            if msg.is_timestamp or not msg.name.strip():
+                continue
+
+            self.status['last_message'] = msg.name[:60]
+
+            # 方向
+            if self._is_self(msg.name):
+                self.log('[POLL] 方向: outgoing (自己) -> SKIP')
+                continue
+
+            self.log('[POLL] 方向: incoming 内容: {!r}'.format(msg.name[:60]))
+
+            # 去重
+            if is_once:
+                # 单次模式: 检查是否已回复过(跨聊天切换时防重)
+                ch = msg.content_hash
+                if ch in replied:
+                    self.log('[DEDUP] 已回复过 -> SKIP')
                     continue
+            else:
+                if msg.runtime_id in baseline:
+                    continue
+                ch = msg.content_hash
+                if ch in replied:
+                    continue
+            self.log('[DEDUP] new=True')
 
-                for chat_name, cfg in active.items():
-                    if not self.monitor_running:
-                        break
+            # 关键词匹配
+            if not self._match_kw(msg.name, rule.keyword):
+                self.log('[MATCH] keyword={!r} result=False'.format(rule.keyword))
+                continue
 
-                    # ====== Step 1: 打开聊天 ======
-                    if not self._open_chat(chat_name):
-                        self.log('[SKIP] 无法打开聊天: {}'.format(chat_name))
-                        self.status['last_skip_reason'] = '无法打开聊天: {}'.format(chat_name)
-                        time.sleep(0.5)
-                        continue
-                    time.sleep(0.4)
+            self.log('[MATCH] keyword={!r} result=True'.format(rule.keyword))
 
-                    # ====== Step 2: 获取当前聊天名 ======
-                    cur_name, items = FreshNav.get_message_items()
-                    self.status['current_chat'] = cur_name or '(无法识别)'
+            # 检查回复内容
+            if not rule.reply.strip():
+                self.log('[SKIP] 回复内容为空')
+                self.status['last_trigger'] = '回复内容为空'
+                continue
 
-                    if not cur_name:
-                        self.log('[CHAT] 当前聊天识别失败, 无法匹配任务')
-                        self.status['last_skip_reason'] = '聊天识别失败'
-                        continue
+            # 防循环
+            if rule.reply.strip() in msg.name:
+                self.log('[SKIP] 防循环: 回复内容已在消息中')
+                continue
 
-                    self.log('[POLL] 当前聊天: {}'.format(cur_name))
+            # 触发!
+            self.log('[KEYWORD] 触发! [{}] kw={!r} msg={!r}'.format(
+                rule.chat, rule.keyword, msg.name[:40]))
+            self.status['last_trigger'] = '成功: {} | {}'.format(rule.chat, rule.keyword)
 
-                    # ====== Step 3: 聊天匹配 ======
-                    chat_match = cur_name.strip() == chat_name.strip()
-                    if not chat_match:
-                        self.log('[SKIP] 当前聊天不匹配: 期望[{}] 实际[{}]'.format(chat_name, cur_name))
-                        self.status['last_skip_reason'] = '聊天不匹配: {} != {}'.format(chat_name, cur_name)
-                        continue
+            ok = self._send_reply(rule.reply)
+            self.status['last_send'] = '成功' if ok else '失败'
+            if ok:
+                self.log('[REPLY] -> [{}]: {}'.format(rule.chat, rule.reply[:40]))
+            replied.add(ch)
+            if len(replied) > 200:
+                self.replied_hashes[rule.chat] = set(list(replied)[-100:])
+            break  # 每条规则每轮最多回复一次
 
-                    self.log('[MATCH] 聊天匹配: True')
-
-                    # ====== Step 4: 初始化去重 ======
-                    if chat_name not in self.baseline_ids:
-                        self.baseline_ids[chat_name] = set()
-                    if chat_name not in self.replied_hashes:
-                        self.replied_hashes[chat_name] = set()
-
-                    baseline = self.baseline_ids[chat_name]
-                    replied = self.replied_hashes[chat_name]
-
-                    # 首次建立基线
-                    is_first_poll = (len(baseline) == 0)
-                    if is_first_poll:
-                        for item in items:
-                            try:
-                                baseline.add(''.join(str(i) for i in item.GetRuntimeId()))
-                            except:
-                                pass
-                        self.log('[BASELINE] {} : {} 条消息加入基线'.format(chat_name, len(baseline)))
-                        continue  # 第一轮不检查，等下一轮
-
-                    # ====== Step 5: 遍历消息 ======
-                    found_incoming = False
-                    for item in items:
-                        if not self.monitor_running: break
-                        msg = RawMsg(item)
-
-                        # 跳过时间标记
-                        if msg.is_timestamp:
-                            continue
-
-                        # 跳过空消息
-                        if not msg.name.strip():
-                            continue
-
-                        self.status['last_message'] = msg.name[:60]
-
-                        # ====== Step 5a: 方向判断 ======
-                        is_self = self._is_self_message(msg.name)
-                        direction = 'outgoing' if is_self else 'incoming'
-                        self.log('[POLL] 消息方向: {} 内容: {!r}'.format(direction, msg.name[:60]))
-
-                        if is_self:
-                            self.log('[SKIP] 消息来自自己, 不触发规则')
-                            continue
-
-                        # ====== Step 5b: 去重 (baseline + replied) ======
-                        if msg.runtime_id in baseline:
-                            self.log('[DEDUP] old=True reason=in_baseline id={}'.format(msg.runtime_id[:20]))
-                            continue
-
-                        ch = msg.content_hash
-                        if ch in replied:
-                            self.log('[DEDUP] old=True reason=already_replied hash={}'.format(ch))
-                            continue
-
-                        self.log('[DEDUP] new=True reason=not_in_seen')
-
-                        # ====== Step 5c: 关键词匹配 ======
-                        keywords = cfg['keywords']
-                        reply_text = cfg['reply']
-                        matched_kw = None
-                        for kw in keywords:
-                            if self._match_keyword(msg.name, kw):
-                                matched_kw = kw
-                                break
-
-                        self.log('[MATCH] keyword=\'{}\' message={!r} result={}'.format(
-                            ','.join(keywords), self._normalize(msg.name)[:40], matched_kw is not None))
-
-                        if not matched_kw:
-                            self.status['last_skip_reason'] = '关键词不匹配'
-                            continue
-
-                        # ====== Step 5d: 检查回复内容 ======
-                        if not reply_text or not reply_text.strip():
-                            self.log('[SKIP] 自动回复内容为空')
-                            self.status['last_skip_reason'] = '回复内容为空'
-                            continue
-
-                        # ====== Step 5e: 防循环(回复内容已在消息中) ======
-                        if reply_text.strip() in msg.name:
-                            self.log('[SKIP] 自己发送的自动回复, 不触发规则')
-                            self.status['last_skip_reason'] = '自动回复内容已在消息中(防循环)'
-                            continue
-
-                        # ====== Step 5f: 触发! ======
-                        self.log('[KEYWORD] 触发! [{}] keyword={!r} message={!r}'.format(
-                            chat_name, matched_kw, msg.name[:40]))
-                        self.status['last_match_task'] = '{} | {}'.format(chat_name, matched_kw)
-                        self.status['last_trigger_result'] = '成功'
-
-                        # ====== Step 5g: 发送回复 ======
-                        self.log('[SEND] 准备发送到聊天: {}'.format(chat_name))
-                        self.log('[SEND] 回复内容: {}'.format(reply_text[:40]))
-                        ok = self._send_reply(reply_text)
-                        if ok:
-                            self.status['last_send_result'] = '成功'
-                            self.log('[REPLY] -> [{}]: {}'.format(chat_name, reply_text[:40]))
-                        else:
-                            self.status['last_send_result'] = '失败'
-                            self.log('[SKIP] 发送失败')
-
-                        # 标记已回复
-                        replied.add(ch)
-                        if len(replied) > 200:
-                            self.replied_hashes[chat_name] = set(list(replied)[-100:])
-
-                        found_incoming = True
-                        break  # 每个聊天每次只回复一条
-
-                    # 更新基线(把本次看到的所有消息ID加入)
-                    new_ids = set()
-                    for item in items:
-                        try:
-                            new_ids.add(''.join(str(i) for i in item.GetRuntimeId()))
-                        except:
-                            pass
-                    self.baseline_ids[chat_name] = baseline | new_ids
-
-                # 等待下次轮询
-                time.sleep(self.poll_interval)
-
-            except Exception as e:
-                self.log('[LOOP] 循环异常: {}'.format(e))
-                import traceback
-                self.log(traceback.format_exc())
-                time.sleep(self.poll_interval)
-
-        self.log('[LOOP] 监控循环已退出')
+        # 更新基线
+        if self.mode == 'loop':
+            for item in items:
+                try: baseline.add(''.join(str(i) for i in item.GetRuntimeId()))
+                except: pass
 
 
 # ==================== Tkinter UI ====================
@@ -637,31 +610,27 @@ class AutoReplyUI:
         engine.load_config()
         self.root = None
         self.log_text = None
-        self.status_vars = {}   # 动态状态变量
 
     def build_and_run(self):
         try:
             import tkinter as tk
-            from tkinter import ttk, messagebox
+            from tkinter import ttk, messagebox, simpledialog
             import tkinter.scrolledtext as st
         except Exception as e:
             print('Tkinter not available: {}'.format(e))
             self._console_mode()
             return
-
-        self.tk = tk
-        self.ttk = ttk
-        self.messagebox = messagebox
-        self.scrolledtext = st
+        self.tk = tk; self.ttk = ttk; self.messagebox = messagebox
+        self.simpledialog = simpledialog; self.scrolledtext = st
 
         self.root = tk.Tk()
-        self.root.title('wxauto 自动回复监控')
-        self.root.geometry('850x720')
-        self.root.minsize(750, 550)
+        self.root.title('wxauto 自动回复监控 v4')
+        self.root.geometry('900x750')
+        self.root.minsize(800, 600)
         self.root.configure(bg='#f0f0f0')
 
         self._build_ui()
-        self._refresh_list()
+        self._refresh_all()
         self._update_status()
         self._pull_logs()
 
@@ -675,346 +644,548 @@ class AutoReplyUI:
     def _build_ui(self):
         tk = self.tk
 
-        # === 标题栏 ===
+        # ===== 标题 =====
         tf = tk.Frame(self.root, bg='#2c3e50', height=42)
-        tf.pack(fill=tk.X)
-        tf.pack_propagate(False)
-        tk.Label(tf, text='wxauto 自动回复监控系统', bg='#2c3e50', fg='white',
+        tf.pack(fill=tk.X); tf.pack_propagate(False)
+        tk.Label(tf, text='wxauto 自动回复监控 v4', bg='#2c3e50', fg='white',
                  font=('Microsoft YaHei', 13, 'bold')).pack(pady=8)
 
-        # === 主区域 ===
+        # ===== 模式选择行 =====
+        mode_bar = tk.Frame(self.root, bg='#34495e')
+        mode_bar.pack(fill=tk.X, padx=8, pady=(5,0))
+
+        tk.Label(mode_bar, text='运行模式:', bg='#34495e', fg='white',
+                 font=('Microsoft YaHei', 10, 'bold')).pack(side=tk.LEFT, padx=8, pady=6)
+
+        self.mode_var = tk.StringVar(value=self.engine.mode)
+        rb_once = tk.Radiobutton(mode_bar, text='检测一次', variable=self.mode_var,
+                                 value='once', command=self._on_mode_change,
+                                 bg='#34495e', fg='white', selectcolor='#34495e',
+                                 activebackground='#34495e', activeforeground='white',
+                                 font=('Microsoft YaHei', 10))
+        rb_once.pack(side=tk.LEFT, padx=5)
+        rb_loop = tk.Radiobutton(mode_bar, text='循环检测', variable=self.mode_var,
+                                 value='loop', command=self._on_mode_change,
+                                 bg='#34495e', fg='white', selectcolor='#34495e',
+                                 activebackground='#34495e', activeforeground='white',
+                                 font=('Microsoft YaHei', 10))
+        rb_loop.pack(side=tk.LEFT, padx=5)
+
+        # 循环参数 (仅在loop模式显示)
+        self.loop_params_frame = tk.Frame(mode_bar, bg='#34495e')
+        self.loop_params_frame.pack(side=tk.LEFT, padx=20)
+        tk.Label(self.loop_params_frame, text='间隔(秒):', bg='#34495e', fg='white',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT)
+        self.entry_interval = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
+                                       width=4, relief=tk.SOLID, bd=1)
+        self.entry_interval.pack(side=tk.LEFT, padx=2)
+        self.entry_interval.insert(0, str(self.engine.poll_interval))
+        tk.Label(self.loop_params_frame, text='最长(秒,0=无限):', bg='#34495e', fg='white',
+                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
+        self.entry_duration = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
+                                       width=5, relief=tk.SOLID, bd=1)
+        self.entry_duration.pack(side=tk.LEFT, padx=2)
+        self.entry_duration.insert(0, str(self.engine.loop_duration))
+        tk.Button(self.loop_params_frame, text='应用', command=self._apply_loop_params,
+                  bg='#3498db', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=5)
+
+        # 预设按钮
+        preset_frame = tk.Frame(mode_bar, bg='#34495e')
+        preset_frame.pack(side=tk.RIGHT, padx=8)
+        tk.Button(preset_frame, text='保存预设', command=self._save_preset,
+                  bg='#8e44ad', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_frame, text='加载预设', command=self._load_preset,
+                  bg='#8e44ad', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_frame, text='删除预设', command=self._delete_preset,
+                  bg='#c0392b', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
+
+        self._update_loop_params_visibility()
+
+        # ===== 主区域 =====
         main = tk.Frame(self.root, bg='#f0f0f0')
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
 
-        # ---- 左侧: 任务列表 ----
-        left = tk.LabelFrame(main, text=' 监控任务列表 ', font=('Microsoft YaHei', 10),
+        # ---- 左侧: 规则列表 ----
+        left = tk.LabelFrame(main, text=' 回复规则列表 ', font=('Microsoft YaHei', 10),
                             bg='#f0f0f0', padx=5, pady=5)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
 
-        lc = tk.Frame(left, bg='#f0f0f0')
-        lc.pack(fill=tk.BOTH, expand=True)
+        # treeview 表格式
+        columns = ('status','chat','keyword','reply')
+        self.rules_tree = tk.ttk.Treeview(left, columns=columns, show='headings',
+                                           height=12, selectmode='browse')
+        self.rules_tree.heading('status', text='状态', anchor='center')
+        self.rules_tree.heading('chat', text='聊天对象')
+        self.rules_tree.heading('keyword', text='关键词')
+        self.rules_tree.heading('reply', text='回复内容')
+        self.rules_tree.column('status', width=40, anchor='center')
+        self.rules_tree.column('chat', width=100)
+        self.rules_tree.column('keyword', width=70)
+        self.rules_tree.column('reply', width=120)
+        self.rules_tree.pack(fill=tk.BOTH, expand=True)
+        self.rules_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
+        # 滚动条
+        tsb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.rules_tree.yview)
+        self.rules_tree.configure(yscrollcommand=tsb.set)
+        tsb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        self.task_listbox = tk.Listbox(lc, font=('Microsoft YaHei', 9),
-                                       selectmode=tk.SINGLE, height=10)
-        sb = tk.Scrollbar(lc, orient=tk.VERTICAL, command=self.task_listbox.yview)
-        self.task_listbox.configure(yscrollcommand=sb.set)
-        self.task_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.task_listbox.bind('<<ListboxSelect>>', self._on_select)
-
-        bf = tk.Frame(left, bg='#f0f0f0')
-        bf.pack(fill=tk.X, pady=(5, 0))
-        tk.Button(bf, text='删除选中', command=self._del, bg='#e74c3c', fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, padx=10).pack(side=tk.LEFT, padx=2)
-        tk.Button(bf, text='启用/禁用', command=self._toggle, bg='#f39c12', fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, padx=10).pack(side=tk.LEFT, padx=2)
+        # 操作按钮
+        btnf = tk.Frame(left, bg='#f0f0f0')
+        btnf.pack(fill=tk.X, pady=(5,0))
+        tk.Button(btnf, text='删除选中', command=self._del_rule,
+                  bg='#e74c3c', fg='white', font=('Microsoft YaHei', 9),
+                  relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(btnf, text='启用/禁用', command=self._toggle_rule,
+                  bg='#f39c12', fg='white', font=('Microsoft YaHei', 9),
+                  relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
+        tk.Button(btnf, text='全部启用', command=lambda: self._all_toggle(True),
+                  bg='#27ae60', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
+        tk.Button(btnf, text='全部禁用', command=lambda: self._all_toggle(False),
+                  bg='#95a5a6', fg='white', font=('Microsoft YaHei', 8),
+                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
 
         # 状态面板
-        status_frame = tk.LabelFrame(left, text=' 运行状态 ', font=('Microsoft YaHei', 10),
-                                     bg='#f0f0f0', padx=5, pady=5)
-        status_frame.pack(fill=tk.X, pady=(8, 0))
-
+        sf = tk.LabelFrame(left, text=' 运行状态 ', font=('Microsoft YaHei', 10),
+                           bg='#f0f0f0', padx=5, pady=5)
+        sf.pack(fill=tk.X, pady=(8,0))
         self.status_labels = {}
-        status_keys = [
-            ('monitor', '监控状态'),
-            ('current_chat', '当前聊天'),
-            ('last_message', '最后检测消息'),
-            ('last_match', '最后匹配任务'),
-            ('last_trigger', '最后触发结果'),
-            ('last_send', '最后发送结果'),
-        ]
-        for key, label in status_keys:
-            row = tk.Frame(status_frame, bg='#f0f0f0')
+        for key, label in [
+            ('monitor','监控状态'), ('mode','运行模式'),
+            ('current_chat','当前聊天'), ('last_message','最后检测消息'),
+            ('last_trigger','最后触发'), ('last_send','最后发送'),
+        ]:
+            row = tk.Frame(sf, bg='#f0f0f0')
             row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=label + ':', bg='#f0f0f0', font=('Microsoft YaHei', 8),
-                     width=12, anchor='e').pack(side=tk.LEFT)
-            val = tk.Label(row, text='-', bg='#f0f0f0', font=('Microsoft YaHei', 8, 'bold'),
-                           fg='#555', anchor='w')
-            val.pack(side=tk.LEFT, padx=(5, 0))
+            tk.Label(row, text=label+':', bg='#f0f0f0', font=('Microsoft YaHei', 8),
+                     width=11, anchor='e').pack(side=tk.LEFT)
+            val = tk.Label(row, text='-', bg='#f0f0f0',
+                           font=('Microsoft YaHei', 8, 'bold'), fg='#555', anchor='w')
+            val.pack(side=tk.LEFT, padx=(3,0))
             self.status_labels[key] = val
-
-        # 提示
-        self.hint_label = tk.Label(status_frame, text='',
-                                   bg='#f0f0f0', font=('Microsoft YaHei', 8), fg='#e67e22', wraplength=280)
-        self.hint_label.pack(fill=tk.X, pady=(5, 0))
+        self.hint_label = tk.Label(sf, text='', bg='#f0f0f0',
+                                   font=('Microsoft YaHei', 8), fg='#e67e22', wraplength=280)
+        self.hint_label.pack(fill=tk.X, pady=(5,0))
 
         # ---- 右侧: 编辑区 ----
-        right = tk.LabelFrame(main, text=' 编辑任务 ', font=('Microsoft YaHei', 10),
+        right = tk.LabelFrame(main, text=' 添加/编辑规则 ', font=('Microsoft YaHei', 10),
                              bg='#f0f0f0', padx=5, pady=5)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5, 0))
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5,0))
 
-        tk.Label(right, text='聊天对象名 (完整匹配):', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(5, 2))
+        tk.Label(right, text='聊天对象名:', bg='#f0f0f0',
+                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(5,2))
         self.entry_chat = tk.Entry(right, font=('Microsoft YaHei', 10), relief=tk.SOLID, bd=1)
         self.entry_chat.pack(fill=tk.X, ipady=3)
 
-        tk.Label(right, text='触发关键词 (逗号分隔):', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8, 2))
-        self.entry_keywords = tk.Entry(right, font=('Microsoft YaHei', 10), relief=tk.SOLID, bd=1)
-        self.entry_keywords.pack(fill=tk.X, ipady=3)
+        tk.Label(right, text='触发关键词:', bg='#f0f0f0',
+                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8,2))
+        self.entry_keyword = tk.Entry(right, font=('Microsoft YaHei', 10), relief=tk.SOLID, bd=1)
+        self.entry_keyword.pack(fill=tk.X, ipady=3)
 
         tk.Label(right, text='自动回复内容:', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8, 2))
-        self.text_reply = tk.Text(right, font=('Microsoft YaHei', 10), height=5,
+                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8,2))
+        self.text_reply = tk.Text(right, font=('Microsoft YaHei', 10), height=4,
                                   relief=tk.SOLID, bd=1, wrap=tk.WORD)
-        self.text_reply.pack(fill=tk.X, pady=(0, 5))
+        self.text_reply.pack(fill=tk.X, pady=(0,5))
 
         brf = tk.Frame(right, bg='#f0f0f0')
-        brf.pack(fill=tk.X, pady=(5, 0))
-        tk.Button(brf, text=' 添加/更新 ', command=self._add, bg='#27ae60', fg='white',
+        brf.pack(fill=tk.X, pady=(5,0))
+        tk.Button(brf, text=' 添加规则 ', command=self._add_rule, bg='#27ae60', fg='white',
+                  font=('Microsoft YaHei', 10, 'bold'), relief=tk.FLAT, padx=12, pady=4
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(brf, text=' 更新选中 ', command=self._update_rule, bg='#2980b9', fg='white',
                   font=('Microsoft YaHei', 10, 'bold'), relief=tk.FLAT, padx=12, pady=4
                   ).pack(side=tk.LEFT, padx=2)
         tk.Button(brf, text=' 清空 ', command=self._clear_form, bg='#95a5a6', fg='white',
                   font=('Microsoft YaHei', 9), relief=tk.FLAT, padx=8, pady=4
                   ).pack(side=tk.LEFT, padx=2)
 
-        tk.Label(right, text='轮询间隔 (秒):', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(12, 2))
-        inf = tk.Frame(right, bg='#f0f0f0')
-        inf.pack(fill=tk.X)
-        self.entry_interval = tk.Entry(inf, font=('Microsoft YaHei', 10), relief=tk.SOLID,
-                                       bd=1, width=6)
-        self.entry_interval.pack(side=tk.LEFT, ipady=3)
-        self.entry_interval.insert(0, str(self.engine.poll_interval))
-        tk.Button(inf, text='应用', command=self._set_interval, bg='#3498db', fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, padx=8, pady=2
-                  ).pack(side=tk.LEFT, padx=5)
-
-        # === 底部: 控制 + 日志 ===
+        # ===== 底部: 控制 + 日志 =====
         bottom = tk.Frame(self.root, bg='#f0f0f0')
-        bottom.pack(fill=tk.X, padx=8, pady=(0, 5))
+        bottom.pack(fill=tk.X, padx=8, pady=(0,5))
 
         ctrl = tk.Frame(bottom, bg='#f0f0f0')
-        ctrl.pack(fill=tk.X, pady=(0, 5))
+        ctrl.pack(fill=tk.X, pady=(0,5))
 
-        self.btn_start = tk.Button(ctrl, text='  启动监控  ', command=self._start,
-                                   bg='#27ae60', fg='white',
-                                   font=('Microsoft YaHei', 11, 'bold'),
-                                   relief=tk.FLAT, padx=18, pady=5)
-        self.btn_start.pack(side=tk.LEFT, padx=3)
+        self.btn_start_once = tk.Button(ctrl, text='  检测一次  ', command=self._start_once,
+                                        bg='#2980b9', fg='white',
+                                        font=('Microsoft YaHei', 10, 'bold'),
+                                        relief=tk.FLAT, padx=12, pady=5)
+        self.btn_start_once.pack(side=tk.LEFT, padx=3)
 
-        self.btn_stop = tk.Button(ctrl, text='  停止监控  ', command=self._stop,
+        self.btn_start_loop = tk.Button(ctrl, text='  循环检测  ', command=self._start_loop,
+                                        bg='#27ae60', fg='white',
+                                        font=('Microsoft YaHei', 10, 'bold'),
+                                        relief=tk.FLAT, padx=12, pady=5)
+        self.btn_start_loop.pack(side=tk.LEFT, padx=3)
+
+        self.btn_stop = tk.Button(ctrl, text='  停止  ', command=self._stop,
                                   bg='#e74c3c', fg='white',
-                                  font=('Microsoft YaHei', 11, 'bold'),
-                                  relief=tk.FLAT, padx=18, pady=5, state=tk.DISABLED)
+                                  font=('Microsoft YaHei', 10, 'bold'),
+                                  relief=tk.FLAT, padx=12, pady=5, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=3)
 
-        self.monitor_led = tk.Label(ctrl, text='O 已停止',
-                                    font=('Microsoft YaHei', 10, 'bold'),
-                                    bg='#f0f0f0', fg='#e74c3c')
-        self.monitor_led.pack(side=tk.LEFT, padx=18)
+        self.led = tk.Label(ctrl, text='O 已停止', font=('Microsoft YaHei', 10, 'bold'),
+                            bg='#f0f0f0', fg='#e74c3c')
+        self.led.pack(side=tk.LEFT, padx=15)
+
+        self.round_label = tk.Label(ctrl, text='',
+                                    font=('Microsoft YaHei', 9), bg='#f0f0f0', fg='#555')
+        self.round_label.pack(side=tk.LEFT, padx=10)
 
         # 日志
-        logf = tk.LabelFrame(bottom, text=' 运行日志 ', font=('Microsoft YaHei', 9),
-                            bg='#f0f0f0', padx=3, pady=3)
-        logf.pack(fill=tk.BOTH, expand=True)
-
-        self.log_text = self.scrolledtext.ScrolledText(
-            logf, font=('Consolas', 9), height=10, relief=tk.SOLID, bd=1,
+        lgf = tk.LabelFrame(bottom, text=' 运行日志 ', font=('Microsoft YaHei', 9),
+                           bg='#f0f0f0', padx=3, pady=3)
+        lgf.pack(fill=tk.BOTH, expand=True)
+        self.log_text = st.ScrolledText(
+            lgf, font=('Consolas', 9), height=10, relief=tk.SOLID, bd=1,
             wrap=tk.WORD, bg='#1e1e1e', fg='#d4d4d4')
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        for tag, color in [('trigger', '#f1c40f'), ('reply', '#2ecc71'),
-                           ('error', '#e74c3c'), ('info', '#3498db'),
-                           ('skip', '#95a5a6'), ('poll', '#8e44ad')]:
+        for tag, color in [('trigger','#f1c40f'),('reply','#2ecc71'),('error','#e74c3c'),
+                           ('info','#3498db'),('skip','#95a5a6'),('poll','#8e44ad')]:
             self.log_text.tag_configure(tag, foreground=color)
 
-    # ---- UI 事件 ----
+    # ===== UI 逻辑 =====
 
     def _append_log(self, msg):
-        if not self.log_text:
-            return
-        tags = []
-        if '[KEYWORD]' in msg or '触发!' in msg:
-            tags.append('trigger')
-        if '[REPLY]' in msg or '[SEND]' in msg:
-            tags.append('reply')
-        if '失败' in msg or '异常' in msg:
-            tags.append('error')
-        if '[START]' in msg or '[STOP]' in msg or '[LOOP]' in msg:
-            tags.append('info')
-        if '[SKIP]' in msg:
-            tags.append('skip')
-        if '[POLL]' in msg or '[MATCH]' in msg or '[DEDUP]' in msg or '[CHAT]' in msg:
-            tags.append('poll')
-        if tags:
-            for t in tags:
-                self.log_text.insert(self.tk.END, msg + '\n', t)
-        else:
-            self.log_text.insert(self.tk.END, msg + '\n')
+        if not self.log_text: return
+        for kw, tag in [('[KEYWORD]','trigger'),('[REPLY]','reply'),('[SEND]','reply'),
+                        ('失败','error'),('异常','error'),
+                        ('[START]','info'),('[STOP]','info'),('[LOOP]','info'),
+                        ('[END]','info'),('[RUN]','info'),
+                        ('[SKIP]','skip'),('[POLL]','poll'),('[MATCH]','poll'),
+                        ('[DEDUP]','poll'),('[CHAT]','poll'),('[ROUND]','poll'),
+                        ('[BASELINE]','poll')]:
+            if kw in msg:
+                self.log_text.insert(self.tk.END, msg+'\n', tag)
+                self.log_text.see(self.tk.END)
+                return
+        self.log_text.insert(self.tk.END, msg+'\n')
         self.log_text.see(self.tk.END)
 
-    def _refresh_list(self):
-        self.task_listbox.delete(0, self.tk.END)
-        for n, c in self.engine.tasks.items():
-            s = '[ON] ' if c.get('enabled', True) else '[OFF]'
-            self.task_listbox.insert(self.tk.END,
-                '{} {}  |  {}'.format(s, n, ','.join(c.get('keywords', []))))
+    def _refresh_rules_tree(self):
+        self.rules_tree.delete(*self.rules_tree.get_children())
+        for i, r in enumerate(self.engine.rules):
+            status = '[ON]' if r.enabled else '[OFF]'
+            self.rules_tree.insert('', self.tk.END, iid=str(i),
+                                   values=(status, r.chat, r.keyword, r.reply))
+
+    def _refresh_all(self):
+        self._refresh_rules_tree()
+        self.mode_var.set(self.engine.mode)
+        self.entry_interval.delete(0, self.tk.END)
+        self.entry_interval.insert(0, str(self.engine.poll_interval))
+        self.entry_duration.delete(0, self.tk.END)
+        self.entry_duration.insert(0, str(self.engine.loop_duration))
         self._update_hint()
+        self._update_loop_params_visibility()
 
-    def _update_status(self):
-        """刷新状态面板"""
-        st = self.engine.status
-        labels = self.status_labels
-
-        # 监控状态
-        running = self.engine.monitor_running
-        labels['monitor'].config(
-            text='运行中' if running else '已停止',
-            fg='#27ae60' if running else '#e74c3c'
-        )
-        self.monitor_led.config(
-            text='O 运行中' if running else 'O 已停止',
-            fg='#27ae60' if running else '#e74c3c'
-        )
-
-        labels['current_chat'].config(text=st.get('current_chat', '-') or '-')
-        labels['last_message'].config(text=(st.get('last_message', '-') or '-')[:40])
-        labels['last_match'].config(text=st.get('last_match_task', '-') or '-')
-        labels['last_trigger'].config(text=st.get('last_trigger_result', '-') or '-')
-        labels['last_send'].config(text=st.get('last_send_result', '-') or '-')
-
-        self._update_hint()
-        self.root.after(1000, self._update_status)
-
-    def _update_hint(self):
-        enabled = [n for n, c in self.engine.tasks.items() if c.get('enabled', True)]
-        running = self.engine.monitor_running
-        if enabled and not running:
-            self.hint_label.config(
-                text='任务已启用({}个)，但监控未启动，请点击"启动监控"。'.format(len(enabled)))
-        elif not enabled:
-            self.hint_label.config(text='还没有添加监控任务，请先在右侧填写并添加。')
-        elif running:
-            self.hint_label.config(text='监控运行中，正在监听 {} 个聊天。'.format(len(enabled)))
+    def _update_loop_params_visibility(self):
+        if self.engine.mode == 'loop':
+            self.loop_params_frame.pack(side=self.tk.LEFT, padx=20)
         else:
-            self.hint_label.config(text='')
+            self.loop_params_frame.pack_forget()
 
-    def _on_select(self, event):
-        sel = self.task_listbox.curselection()
-        if not sel: return
-        names = list(self.engine.tasks.keys())
-        if sel[0] >= len(names): return
-        n = names[sel[0]]
-        c = self.engine.tasks[n]
-        self._clear_form()
-        self.entry_chat.insert(0, n)
-        self.entry_keywords.insert(0, ','.join(c.get('keywords', [])))
-        self.text_reply.insert('1.0', c.get('reply', ''))
+    def _on_mode_change(self):
+        self.engine.mode = self.mode_var.get()
+        self.engine.save_config()
+        self._update_loop_params_visibility()
+        self.log('[MODE] 切换至: {}'.format('循环检测' if self.engine.mode=='loop' else '检测一次'))
 
-    def _clear_form(self):
-        self.entry_chat.delete(0, self.tk.END)
-        self.entry_keywords.delete(0, self.tk.END)
-        self.text_reply.delete('1.0', self.tk.END)
-
-    def _add(self):
-        c = self.entry_chat.get().strip()
-        k = self.entry_keywords.get().strip()
-        r = self.text_reply.get('1.0', self.tk.END).strip()
-        if not c or not k or not r:
-            self.messagebox.showwarning('提示', '请填写完整')
-            return
-        self.engine.add_task(c, k, r)
-        self._refresh_list()
-        self._clear_form()
-
-    def _del(self):
-        sel = self.task_listbox.curselection()
-        if not sel: return
-        names = list(self.engine.tasks.keys())
-        if sel[0] >= len(names): return
-        n = names[sel[0]]
-        if self.messagebox.askyesno('确认删除', '确定要删除 [{}] 吗?'.format(n)):
-            self.engine.remove_task(n)
-            self._refresh_list()
-            self._clear_form()
-
-    def _toggle(self):
-        sel = self.task_listbox.curselection()
-        if not sel: return
-        names = list(self.engine.tasks.keys())
-        if sel[0] >= len(names): return
-        n = names[sel[0]]
-        c = self.engine.tasks[n]
-        self.engine.toggle_task(n, not c.get('enabled', True))
-        self._refresh_list()
-
-    def _start(self):
-        if self.engine.start():
-            self.btn_start.config(state=self.tk.DISABLED)
-            self.btn_stop.config(state=self.tk.NORMAL)
-            self._update_status()
-
-    def _stop(self):
-        self.engine.stop()
-        self.btn_start.config(state=self.tk.NORMAL)
-        self.btn_stop.config(state=self.tk.DISABLED)
-        self._update_status()
-
-    def _set_interval(self):
+    def _apply_loop_params(self):
         try:
             v = int(self.entry_interval.get().strip())
             if v < 1: raise ValueError
             self.engine.poll_interval = v
-            self.engine.save_config()
-            self.messagebox.showinfo('成功', '轮询间隔已设为 {} 秒'.format(v))
         except:
-            self.messagebox.showwarning('错误', '请输入 1 以上的整数')
+            self.messagebox.showwarning('错误', '间隔必须是 >=1 的整数')
+            return
+        try:
+            d = int(self.entry_duration.get().strip())
+            if d < 0: raise ValueError
+            self.engine.loop_duration = d
+        except:
+            self.messagebox.showwarning('错误', '最长运行时间必须是 >=0 的整数')
+            return
+        self.engine.save_config()
+        self.log('[CONFIG] 间隔={}秒 最长={}秒'.format(v, d))
+
+    def _on_tree_select(self, event):
+        sel = self.rules_tree.selection()
+        if not sel: return
+        idx = int(sel[0])
+        if idx >= len(self.engine.rules): return
+        r = self.engine.rules[idx]
+        self._clear_form()
+        self.entry_chat.insert(0, r.chat)
+        self.entry_keyword.insert(0, r.keyword)
+        self.text_reply.insert('1.0', r.reply)
+
+    def _clear_form(self):
+        self.entry_chat.delete(0, self.tk.END)
+        self.entry_keyword.delete(0, self.tk.END)
+        self.text_reply.delete('1.0', self.tk.END)
+
+    def _add_rule(self):
+        c = self.entry_chat.get().strip()
+        k = self.entry_keyword.get().strip()
+        r = self.text_reply.get('1.0', self.tk.END).strip()
+        if not c or not k or not r:
+            self.messagebox.showwarning('提示', '请填写完整')
+            return
+        self.engine.add_rule(c, k, r)
+        self._refresh_rules_tree()
+        self._clear_form()
+        self._update_hint()
+
+    def _update_rule(self):
+        sel = self.rules_tree.selection()
+        if not sel: return
+        idx = int(sel[0])
+        if idx >= len(self.engine.rules): return
+        c = self.entry_chat.get().strip()
+        k = self.entry_keyword.get().strip()
+        r = self.text_reply.get('1.0', self.tk.END).strip()
+        if not c or not k or not r:
+            self.messagebox.showwarning('提示', '请填写完整')
+            return
+        with self.engine._lock:
+            self.engine.rules[idx].chat = c
+            self.engine.rules[idx].keyword = k
+            self.engine.rules[idx].reply = r
+        self.engine.save_config()
+        self._refresh_rules_tree()
+        self._clear_form()
+        self.engine.log('更新规则#{}: {} | {}'.format(idx+1, c, k))
+
+    def _del_rule(self):
+        sel = self.rules_tree.selection()
+        if not sel: return
+        idx = int(sel[0])
+        if idx >= len(self.engine.rules): return
+        r = self.engine.rules[idx]
+        if self.messagebox.askyesno('确认', '删除规则: {} | {}?'.format(r.chat, r.keyword)):
+            self.engine.remove_rule(idx)
+            self._refresh_rules_tree()
+            self._clear_form()
+            self._update_hint()
+
+    def _toggle_rule(self):
+        sel = self.rules_tree.selection()
+        if not sel: return
+        idx = int(sel[0])
+        if idx >= len(self.engine.rules): return
+        self.engine.toggle_rule(idx)
+        self._refresh_rules_tree()
+
+    def _all_toggle(self, enabled):
+        for i in range(len(self.engine.rules)):
+            self.engine.toggle_rule(i, enabled)
+        self._refresh_rules_tree()
+        self._update_hint()
+
+    def _start_once(self):
+        if self.engine.start(mode='once'):
+            self._set_ui_running()
+
+    def _start_loop(self):
+        self._apply_loop_params()  # 先应用参数
+        if self.engine.start(mode='loop'):
+            self._set_ui_running()
+
+    def _stop(self):
+        self.engine.stop()
+        self._set_ui_stopped()
+
+    def _set_ui_running(self):
+        self.btn_start_once.config(state=self.tk.DISABLED)
+        self.btn_start_loop.config(state=self.tk.DISABLED)
+        self.btn_stop.config(state=self.tk.NORMAL)
+
+    def _set_ui_stopped(self):
+        self.btn_start_once.config(state=self.tk.NORMAL)
+        self.btn_start_loop.config(state=self.tk.NORMAL)
+        self.btn_stop.config(state=self.tk.DISABLED)
+
+    def _save_preset(self):
+        name = self.simpledialog.askstring('保存预设', '预设名称:')
+        if not name: return
+        self.engine.save_preset(name)
+        self.messagebox.showinfo('成功', '预设 {} 已保存'.format(name))
+
+    def _load_preset(self):
+        tk = self.tk
+        presets = self.engine.load_presets()
+        if not presets:
+            self.messagebox.showinfo('提示', '没有已保存的预设')
+            return
+        names = sorted(presets.keys())
+        dialog = tk.Toplevel(self.root)
+        dialog.title('加载预设'); dialog.geometry('400x350')
+        dialog.configure(bg='#f0f0f0')
+        tk.Label(dialog, text='选择预设:', font=('Microsoft YaHei', 10),
+                 bg='#f0f0f0').pack(pady=8)
+        lb = tk.Listbox(dialog, font=('Microsoft YaHei', 10), selectmode=tk.SINGLE)
+        lb.pack(fill=tk.BOTH, expand=True, padx=10)
+        for n in names:
+            p = presets[n]
+            lb.insert(tk.END, '{} ({}, {}条规则)'.format(
+                n, '循环' if p.get('mode')=='loop' else '单次', len(p.get('rules',[]))))
+        def do_load():
+            sel = lb.curselection()
+            if not sel: return
+            self.engine.load_preset(names[sel[0]])
+            self._refresh_all()
+            dialog.destroy()
+        btnf = tk.Frame(dialog, bg='#f0f0f0')
+        btnf.pack(pady=8)
+        tk.Button(btnf, text=' 加载 ', command=do_load, bg='#27ae60', fg='white',
+                  font=('Microsoft YaHei', 10), relief=tk.FLAT, padx=15).pack(side=tk.LEFT, padx=5)
+        tk.Button(btnf, text=' 取消 ', command=dialog.destroy, bg='#95a5a6', fg='white',
+                  font=('Microsoft YaHei', 10), relief=tk.FLAT, padx=15).pack(side=tk.LEFT, padx=5)
+        dialog.transient(self.root); dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def _delete_preset(self):
+        tk = self.tk
+        presets = self.engine.load_presets()
+        if not presets:
+            self.messagebox.showinfo('提示', '没有已保存的预设')
+            return
+        names = sorted(presets.keys())
+        dialog = tk.Toplevel(self.root)
+        dialog.title('删除预设'); dialog.geometry('400x350')
+        dialog.configure(bg='#f0f0f0')
+        tk.Label(dialog, text='选择要删除的预设:', font=('Microsoft YaHei', 10),
+                 bg='#f0f0f0').pack(pady=8)
+        lb = tk.Listbox(dialog, font=('Microsoft YaHei', 10))
+        lb.pack(fill=tk.BOTH, expand=True, padx=10)
+        for n in names: lb.insert(tk.END, n)
+        def do_del():
+            sel = lb.curselection()
+            if not sel: return
+            n = names[sel[0]]
+            if self.messagebox.askyesno('确认', '删除预设 {}?'.format(n), parent=dialog):
+                self.engine.delete_preset(n)
+                dialog.destroy()
+        btnf = tk.Frame(dialog, bg='#f0f0f0')
+        btnf.pack(pady=8)
+        tk.Button(btnf, text=' 删除 ', command=do_del, bg='#e74c3c', fg='white',
+                  font=('Microsoft YaHei', 10), relief=tk.FLAT, padx=15).pack(side=tk.LEFT, padx=5)
+        tk.Button(btnf, text=' 取消 ', command=dialog.destroy, bg='#95a5a6', fg='white',
+                  font=('Microsoft YaHei', 10), relief=tk.FLAT, padx=15).pack(side=tk.LEFT, padx=5)
+        dialog.transient(self.root); dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def _update_status(self):
+        st = self.engine.status
+        labels = self.status_labels
+        running = self.engine.monitor_running
+        labels['monitor'].config(text='运行中' if running else '已停止',
+                                 fg='#27ae60' if running else '#e74c3c')
+        self.led.config(text='O 运行中' if running else 'O 已停止',
+                        fg='#27ae60' if running else '#e74c3c')
+        labels['mode'].config(text=st.get('mode','-'))
+        labels['current_chat'].config(text=(st.get('current_chat','-') or '-')[:25])
+        labels['last_message'].config(text=(st.get('last_message','-') or '-')[:30])
+        labels['last_trigger'].config(text=(st.get('last_trigger','-') or '-')[:30])
+        labels['last_send'].config(text=(st.get('last_send','-') or '-')[:20])
+
+        round_num = st.get('round',0)
+        total = st.get('total_rounds',0)
+        if running and total == '-':
+            self.round_label.config(text='第{}轮'.format(round_num))
+        elif running:
+            self.round_label.config(text='第{}/{}轮'.format(round_num, total))
+        else:
+            self.round_label.config(text='')
+
+        if not running:
+            self._set_ui_stopped()
+        self._update_hint()
+        self.root.after(1000, self._update_status)
+
+    def _update_hint(self):
+        enabled = sum(1 for r in self.engine.rules if r.enabled)
+        running = self.engine.monitor_running
+        if enabled and not running:
+            self.hint_label.config(
+                text='已配置{}条规则，点击[检测一次]或[循环检测]开始'.format(enabled))
+        elif not enabled:
+            self.hint_label.config(text='还没有规则，请先在右侧添加并启用。')
+        elif running:
+            mode = '循环' if self.engine.mode=='loop' else '单次'
+            self.hint_label.config(text='{}检测中，{}条规则启用。'.format(mode, enabled))
+        else:
+            self.hint_label.config(text='')
 
     def _pull_logs(self):
         if not self.log_text or not self.root: return
         try:
-            while True:
-                self._append_log(self.engine.log_queue.get_nowait())
-        except queue.Empty:
-            pass
+            while True: self._append_log(self.engine.log_queue.get_nowait())
+        except queue.Empty: pass
         self.root.after(300, self._pull_logs)
 
     def _console_mode(self):
-        print('=' * 50)
-        print('  wxauto 自动回复监控 - 控制台模式')
-        print('=' * 50)
+        print('='*55)
+        print('  wxauto 自动回复监控 v4 - 控制台模式')
+        print('='*55)
         self.engine.load_config()
-        if self.engine.tasks:
-            print('已加载 {} 个任务'.format(len(self.engine.tasks)))
-            for n, c in self.engine.tasks.items():
-                print('  {} {} -> {}'.format(
-                    '[ON]' if c.get('enabled', True) else '[OFF]', n,
-                    ','.join(c['keywords'])))
+        print('模式: {} | 规则: {}条'.format(
+            '循环' if self.engine.mode=='loop' else '单次', len(self.engine.rules)))
+        for i, r in enumerate(self.engine.rules):
+            print('  #{}. {} {} -> {}'.format(i+1, r.chat, r.keyword, r.reply[:30]))
         print()
-        print('命令: start | stop | quit | 聊天名|关键词|回复内容')
+        print('命令: once | loop | start | stop | quit | add:聊天|关键词|回复')
+        print('      del:# | toggle:# | preset:save:name | preset:load:name')
         def log_printer():
             while self.engine.monitor_running or not self.engine.log_queue.empty():
-                try:
-                    print(self.engine.log_queue.get(timeout=0.5))
+                try: print(self.engine.log_queue.get(timeout=0.5))
                 except queue.Empty:
                     if not self.engine.monitor_running: break
         while True:
             try: cmd = input('>> ').strip()
-            except (EOFError, KeyboardInterrupt): break
+            except (EOFError, KeyboardInterrupt):
+                self.engine.stop(); break
             if not cmd: continue
-            if cmd == 'quit': break
+            if cmd == 'quit': self.engine.stop(); break
+            if cmd == 'once': self.engine.start('once'); continue
+            if cmd == 'loop':
+                self.engine.start('loop')
+                threading.Thread(target=log_printer, daemon=True).start()
+                continue
             if cmd == 'start':
                 self.engine.start()
                 threading.Thread(target=log_printer, daemon=True).start()
                 continue
             if cmd == 'stop': self.engine.stop(); continue
-            if cmd.startswith('del '):
-                t = cmd[4:].strip()
-                if t in self.engine.tasks:
-                    self.engine.remove_task(t); print('已删除')
-                else: print('未找到')
+            if cmd.startswith('add:'):
+                parts = cmd[4:].split('|',2)
+                if len(parts)==3:
+                    self.engine.add_rule(parts[0].strip(), parts[1].strip(), parts[2].strip())
                 continue
-            if '|' in cmd:
-                parts = [p.strip() for p in cmd.split('|')]
-                if len(parts) >= 3:
-                    self.engine.add_task(parts[0], parts[1].split(','),
-                                         '|'.join(parts[2:])); print('已添加')
-        self.engine.stop()
+            if cmd.startswith('del:'):
+                try: self.engine.remove_rule(int(cmd[4:])-1)
+                except: pass
+                continue
+            if cmd.startswith('toggle:'):
+                try: self.engine.toggle_rule(int(cmd[7:])-1)
+                except: pass
+                continue
+            if cmd.startswith('preset:save:'):
+                self.engine.save_preset(cmd[12:].strip()); continue
+            if cmd.startswith('preset:load:'):
+                self.engine.load_preset(cmd[12:].strip()); self._refresh_all()
+                continue
         print('已退出')
 
 
 def main():
-    engine = MonitorEngine(poll_interval=3)
+    engine = MonitorEngine()
     if '--console' in sys.argv:
         AutoReplyUI(engine)._console_mode()
     else:
