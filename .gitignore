@@ -12,3 +12,6 @@ auto_reply_config.json
 test_*.py
 explore_*.py
 auto_reply_presets.json
+dist/
+build/
+*.spec

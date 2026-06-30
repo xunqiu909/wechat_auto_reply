@@ -877,11 +877,68 @@ class MonitorEngine:
 
 class AutoReplyUI:
 
+    C = {'bg':'#F5F7FA','card':'#FFFFFF','header':'#24292E',
+         'primary':'#07C160','primary_hov':'#06AD56','blue':'#1677FF',
+         'blue_hov':'#4096FF','danger':'#F5222D','danger_hov':'#FF4D4F',
+         'warning':'#FAAD14','text':'#1F2937','text2':'#6B7280',
+         'border':'#E5E7EB','row_even':'#FAFBFC','row_hover':'#E8F5E9',}
+
     def __init__(self, engine):
         self.engine = engine
         engine.load_config()
         self.root = None
         self.log_text = None
+
+    def _btn(self, parent, text, cmd, color, hcolor, w=11, fs=10):
+        tk = self.tk; c=self.C.get(color,color); hc=self.C.get(hcolor,hcolor)
+        b = tk.Frame(parent, bg=self.C['border'], cursor='hand2', padx=1, pady=1)
+        i = tk.Frame(b, bg=c); i.pack(fill=tk.BOTH, expand=True)
+        l = tk.Label(i, text=text, bg=c, fg='white',
+                     font=('Microsoft YaHei UI', fs, 'bold'), padx=w, pady=4)
+        l.pack()
+        def cb(e): cmd()
+        def en(e): i.configure(bg=hc); l.configure(bg=hc)
+        def le(e): i.configure(bg=c); l.configure(bg=c)
+        for w in (b,i,l): w.bind('<Button-1>',cb); w.bind('<Enter>',en); w.bind('<Leave>',le)
+        return b
+
+    def _bsm(self, parent, text, cmd, color, hcolor):
+        tk = self.tk; c=self.C.get(color,color); hc=self.C.get(hcolor,hcolor)
+        b = tk.Frame(parent, bg=self.C['border'], cursor='hand2', padx=1, pady=1)
+        i = tk.Frame(b, bg=c); i.pack(fill=tk.BOTH, expand=True)
+        l = tk.Label(i, text=text, bg=c, fg='white',
+                     font=('Microsoft YaHei UI', 9, 'bold'), padx=10, pady=3)
+        l.pack()
+        def cb(e): cmd()
+        def en(e): i.configure(bg=hc); l.configure(bg=hc)
+        def le(e): i.configure(bg=c); l.configure(bg=c)
+        for w in (b,i,l): w.bind('<Button-1>',cb); w.bind('<Enter>',en); w.bind('<Leave>',le)
+        return b
+
+    def _card(self, parent, title=None, px=10, py=10):
+        tk = self.tk
+        outer = tk.Frame(parent, bg=self.C['border'], padx=2, pady=2)
+        inner = tk.Frame(outer, bg=self.C['card'], padx=px, pady=py)
+        inner.pack(fill=tk.BOTH, expand=True)
+        if title:
+            h = tk.Frame(inner, bg=self.C['card'], height=26); h.pack(fill=tk.X, pady=(0,5))
+            h.pack_propagate(False)
+            tk.Label(h, text=title, bg=self.C['card'], fg=self.C['text'],
+                     font=('Microsoft YaHei UI', 10, 'bold')).pack(side=tk.LEFT)
+            tk.Frame(h, bg=self.C['border'], height=1).pack(side=tk.BOTTOM, fill=tk.X)
+        return outer, inner
+
+    def _lbl(self, parent, text):
+        tk = self.tk
+        tk.Label(parent, text=text, bg=self.C['card'], fg=self.C['text2'],
+                 font=('Microsoft YaHei UI', 9), anchor='w').pack(fill=tk.X, pady=(6,3))
+
+    def _ent(self, parent):
+        tk = self.tk
+        e = tk.Entry(parent, font=('Microsoft YaHei UI', 10), relief=tk.FLAT, bd=0,
+                     bg='#F9FAFB', fg=self.C['text'], insertbackground='#07C160')
+        e.pack(fill=tk.X, ipady=4, pady=(0,2))
+        return e
 
     def build_and_run(self):
         try:
@@ -896,249 +953,166 @@ class AutoReplyUI:
         self.simpledialog = simpledialog; self.scrolledtext = st
 
         self.root = tk.Tk()
-        self.root.title('wxauto 自动回复监控 v4')
-        self.root.geometry('900x750')
-        self.root.minsize(800, 600)
-        self.root.configure(bg='#f0f0f0')
+        self.root.title('wxauto 自动回复监控')
+        self.root.geometry('900x780')
+        self.root.minsize(820, 600)
+        self.root.configure(bg=self.C['bg'])
 
         self._build_ui()
         self._refresh_all()
         self._update_status()
         self._pull_logs()
 
-        def on_close():
-            self.engine.stop()
-            try: self.root.destroy()
-            except: pass
-        self.root.protocol('WM_DELETE_WINDOW', on_close)
+        self.root.protocol('WM_DELETE_WINDOW',
+            lambda: (self.engine.stop(), self.root.destroy()))
 
-        # Ctrl+C 强制停止
         def force_stop(e=None):
-            self.engine.log('[CTRL+C] 强制中断')
-            self.engine.stop()
+            self.engine.log('[CTRL+C] 强制中断'); self.engine.stop()
         self.root.bind_all('<Control-c>', force_stop)
-
-        # 系统 signal (控制台 Ctrl+C, 即使窗口未聚焦也生效)
         try:
             import signal
             signal.signal(signal.SIGINT, lambda sig, frame: force_stop())
-        except:
-            pass
+        except: pass
 
         self.root.mainloop()
 
     def _build_ui(self):
         tk = self.tk
 
-        # ===== 标题 =====
-        tf = tk.Frame(self.root, bg='#2c3e50', height=42)
-        tf.pack(fill=tk.X); tf.pack_propagate(False)
-        tk.Label(tf, text='wxauto 自动回复监控 v4', bg='#2c3e50', fg='white',
-                 font=('Microsoft YaHei', 13, 'bold')).pack(pady=8)
+        # ========== HEADER ==========
+        hdr = tk.Frame(self.root, bg=self.C['header'], padx=16, pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text='wxauto 自动回复监控', bg=self.C['header'], fg='white',
+                 font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT)
+        tk.Label(hdr, text='微信消息关键词自动回复工具', bg=self.C['header'],
+                 fg='#9CA3AF', font=('Microsoft YaHei UI', 9)).pack(side=tk.LEFT, padx=12)
+        self.header_badge = tk.Label(hdr, text='已停止', bg=self.C['danger'], fg='white',
+                                     font=('Microsoft YaHei UI', 9, 'bold'), padx=10, pady=2)
+        self.header_badge.pack(side=tk.RIGHT)
 
-        # ===== 模式选择行 =====
-        mode_bar = tk.Frame(self.root, bg='#34495e')
-        mode_bar.pack(fill=tk.X, padx=8, pady=(5,0))
-
-        tk.Label(mode_bar, text='运行模式:', bg='#34495e', fg='white',
-                 font=('Microsoft YaHei', 10, 'bold')).pack(side=tk.LEFT, padx=8, pady=6)
-
+        # ========== PARAMS CARD ==========
+        pc_out, pc = self._card(self.root)
+        pc_out.pack(fill=tk.X, padx=10, pady=(8, 0))
+        r1 = tk.Frame(pc, bg=self.C['card']); r1.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(r1, text='运行模式', bg=self.C['card'], fg=self.C['text'],
+                 font=('Microsoft YaHei UI', 10, 'bold')).pack(side=tk.LEFT, padx=(0, 10))
         self.mode_var = tk.StringVar(value=self.engine.mode)
-        rb_once = tk.Radiobutton(mode_bar, text='检测一次', variable=self.mode_var,
-                                 value='once', command=self._on_mode_change,
-                                 bg='#34495e', fg='white', selectcolor='#34495e',
-                                 activebackground='#34495e', activeforeground='white',
-                                 font=('Microsoft YaHei', 10))
-        rb_once.pack(side=tk.LEFT, padx=5)
-        rb_loop = tk.Radiobutton(mode_bar, text='循环检测', variable=self.mode_var,
-                                 value='loop', command=self._on_mode_change,
-                                 bg='#34495e', fg='white', selectcolor='#34495e',
-                                 activebackground='#34495e', activeforeground='white',
-                                 font=('Microsoft YaHei', 10))
-        rb_loop.pack(side=tk.LEFT, padx=5)
-
-        # 循环参数 (仅在loop模式显示)
-        self.loop_params_frame = tk.Frame(mode_bar, bg='#34495e')
-        self.loop_params_frame.pack(side=tk.LEFT, padx=20)
-        tk.Label(self.loop_params_frame, text='激活(秒):', bg='#34495e', fg='white',
-                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT)
-        self.entry_active = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
-                                      width=4, relief=tk.SOLID, bd=1)
-        self.entry_active.pack(side=tk.LEFT, padx=2)
-        self.entry_active.insert(0, str(self.engine.active_duration))
-        tk.Label(self.loop_params_frame, text='暂停(秒):', bg='#34495e', fg='white',
-                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
-        self.entry_pause = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
-                                     width=4, relief=tk.SOLID, bd=1)
-        self.entry_pause.pack(side=tk.LEFT, padx=2)
-        self.entry_pause.insert(0, str(self.engine.pause_duration))
-        tk.Label(self.loop_params_frame, text='间隔(秒):', bg='#34495e', fg='white',
-                 font=('Microsoft YaHei', 9)).pack(side=tk.LEFT, padx=(8,0))
-        self.entry_interval = tk.Entry(self.loop_params_frame, font=('Microsoft YaHei', 9),
-                                       width=4, relief=tk.SOLID, bd=1)
-        self.entry_interval.pack(side=tk.LEFT, padx=2)
-        self.entry_interval.insert(0, str(self.engine.poll_interval))
-        tk.Button(self.loop_params_frame, text='应用', command=self._apply_loop_params,
-                  bg='#3498db', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=5)
-
-        # 预设按钮
-        preset_frame = tk.Frame(mode_bar, bg='#34495e')
-        preset_frame.pack(side=tk.RIGHT, padx=8)
-        tk.Button(preset_frame, text='保存预设', command=self._save_preset,
-                  bg='#8e44ad', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_frame, text='加载预设', command=self._load_preset,
-                  bg='#8e44ad', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
-        tk.Button(preset_frame, text='删除预设', command=self._delete_preset,
-                  bg='#c0392b', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
-
+        for txt, val in [('检测一次', 'once'), ('循环检测', 'loop')]:
+            tk.Radiobutton(r1, text=txt, variable=self.mode_var, value=val,
+                           command=self._on_mode_change, bg=self.C['card'], fg=self.C['text'],
+                           activebackground=self.C['card'],
+                           font=('Microsoft YaHei UI', 10)).pack(side=tk.LEFT, padx=5)
+        self.loop_params_frame = tk.Frame(r1, bg=self.C['card'])
+        self.loop_params_frame.pack(side=tk.LEFT, padx=15)
+        for label, name, attr in [('激活秒', 'entry_active', 'active_duration'),
+                                   ('暂停秒', 'entry_pause', 'pause_duration'),
+                                   ('间隔秒', 'entry_interval', 'poll_interval')]:
+            tk.Label(self.loop_params_frame, text=label, bg=self.C['card'],
+                     fg=self.C['text2'], font=('Microsoft YaHei UI', 8)).pack(side=tk.LEFT, padx=(6, 2))
+            e = tk.Entry(self.loop_params_frame, font=('Consolas', 10), width=5,
+                         relief=tk.FLAT, bd=0, bg='#F9FAFB', fg=self.C['text'], justify='center')
+            e.pack(side=tk.LEFT); setattr(self, name, e)
+            e.insert(0, str(getattr(self.engine, attr)))
+        self._bsm(self.loop_params_frame, '应用参数', self._apply_loop_params, 'blue', 'blue_hov').pack(side=tk.LEFT, padx=8)
+        pr = tk.Frame(r1, bg=self.C['card']); pr.pack(side=tk.RIGHT)
+        self._bsm(pr, '保存预设', self._save_preset, 'text2', 'text2').pack(side=tk.LEFT, padx=3)
+        self._bsm(pr, '加载预设', self._load_preset, 'text2', 'text2').pack(side=tk.LEFT, padx=3)
+        self._bsm(pr, '删除预设', self._delete_preset, 'text2', 'text2').pack(side=tk.LEFT, padx=3)
         self._update_loop_params_visibility()
 
-        # ===== 主区域 =====
-        main = tk.Frame(self.root, bg='#f0f0f0')
-        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=5)
+        # ========== MAIN: LEFT + RIGHT ==========
+        main = tk.Frame(self.root, bg=self.C['bg'])
+        main.pack(fill=tk.BOTH, expand=True, padx=10, pady=8)
 
-        # ---- 左侧: 规则列表 ----
-        left = tk.LabelFrame(main, text=' 回复规则列表 ', font=('Microsoft YaHei', 10),
-                            bg='#f0f0f0', padx=5, pady=5)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0,5))
-
-        # treeview 表格式
-        columns = ('status','chat','keyword','reply')
-        self.rules_tree = tk.ttk.Treeview(left, columns=columns, show='headings',
-                                           height=12, selectmode='browse')
-        self.rules_tree.heading('status', text='状态', anchor='center')
-        self.rules_tree.heading('chat', text='聊天对象')
-        self.rules_tree.heading('keyword', text='关键词')
-        self.rules_tree.heading('reply', text='回复内容')
-        self.rules_tree.column('status', width=40, anchor='center')
-        self.rules_tree.column('chat', width=100)
-        self.rules_tree.column('keyword', width=70)
-        self.rules_tree.column('reply', width=120)
-        self.rules_tree.pack(fill=tk.BOTH, expand=True)
+        # ---- LEFT CARD ----
+        l_out, lc = self._card(main, '回复规则列表')
+        l_out.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        tree_frame = tk.Frame(lc, bg=self.C['card']); tree_frame.pack(fill=tk.BOTH, expand=True)
+        sty = self.ttk.Style(); sty.theme_use('clam')
+        sty.configure('R.Treeview', font=('Microsoft YaHei UI', 9), rowheight=28,
+                      background=self.C['card'], fieldbackground=self.C['card'],
+                      foreground=self.C['text'], borderwidth=0)
+        sty.configure('R.Treeview.Heading', font=('Microsoft YaHei UI', 9, 'bold'),
+                      background='#F3F4F6', foreground=self.C['text'], relief='flat', borderwidth=0)
+        sty.map('R.Treeview', background=[('selected', self.C['row_hover'])],
+                foreground=[('selected', self.C['text'])])
+        cols = ('status', 'chat', 'keyword', 'reply')
+        self.rules_tree = tk.ttk.Treeview(tree_frame, columns=cols, show='headings',
+                                          height=8, selectmode='browse', style='R.Treeview')
+        self.rules_tree.heading('status', text='状态'); self.rules_tree.column('status', width=45, anchor='center')
+        self.rules_tree.heading('chat', text='聊天对象'); self.rules_tree.column('chat', width=110)
+        self.rules_tree.heading('keyword', text='关键词'); self.rules_tree.column('keyword', width=75)
+        self.rules_tree.heading('reply', text='回复内容'); self.rules_tree.column('reply', width=130)
+        self.rules_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.rules_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
-        # 滚动条
-        tsb = tk.Scrollbar(left, orient=tk.VERTICAL, command=self.rules_tree.yview)
-        self.rules_tree.configure(yscrollcommand=tsb.set)
-        tsb.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # 操作按钮
-        btnf = tk.Frame(left, bg='#f0f0f0')
-        btnf.pack(fill=tk.X, pady=(5,0))
-        tk.Button(btnf, text='删除选中', command=self._del_rule,
-                  bg='#e74c3c', fg='white', font=('Microsoft YaHei', 9),
-                  relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
-        tk.Button(btnf, text='启用/禁用', command=self._toggle_rule,
-                  bg='#f39c12', fg='white', font=('Microsoft YaHei', 9),
-                  relief=tk.FLAT, padx=8).pack(side=tk.LEFT, padx=2)
-        tk.Button(btnf, text='全部启用', command=lambda: self._all_toggle(True),
-                  bg='#27ae60', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
-        tk.Button(btnf, text='全部禁用', command=lambda: self._all_toggle(False),
-                  bg='#95a5a6', fg='white', font=('Microsoft YaHei', 8),
-                  relief=tk.FLAT, padx=6).pack(side=tk.LEFT, padx=2)
-
-        # 状态面板
-        sf = tk.LabelFrame(left, text=' 运行状态 ', font=('Microsoft YaHei', 10),
-                           bg='#f0f0f0', padx=5, pady=5)
-        sf.pack(fill=tk.X, pady=(8,0))
+        sb = tk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.rules_tree.yview,
+                         bg=self.C['card']); self.rules_tree.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        bf = tk.Frame(lc, bg=self.C['card']); bf.pack(fill=tk.X, pady=(8, 0))
+        self._bsm(bf, '删除选中', self._del_rule, 'danger', 'danger_hov').pack(side=tk.LEFT, padx=2)
+        self._bsm(bf, '启用/禁用', self._toggle_rule, 'warning', 'warning').pack(side=tk.LEFT, padx=2)
+        self._bsm(bf, '全部启用', lambda: self._all_toggle(True), 'primary', 'primary_hov').pack(side=tk.LEFT, padx=2)
+        self._bsm(bf, '全部禁用', lambda: self._all_toggle(False), 'text2', 'text2').pack(side=tk.LEFT, padx=2)
+        # status panel
+        s_out, sc = self._card(lc, '运行状态'); s_out.pack(fill=tk.X, pady=(8, 0))
         self.status_labels = {}
-        for key, label in [
-            ('monitor','监控状态'), ('mode','运行模式'),
-            ('current_chat','当前聊天'), ('last_message','最后检测消息'),
-            ('last_trigger','最后触发'), ('last_send','最后发送'),
-        ]:
-            row = tk.Frame(sf, bg='#f0f0f0')
-            row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=label+':', bg='#f0f0f0', font=('Microsoft YaHei', 8),
-                     width=11, anchor='e').pack(side=tk.LEFT)
-            val = tk.Label(row, text='-', bg='#f0f0f0',
-                           font=('Microsoft YaHei', 8, 'bold'), fg='#555', anchor='w')
-            val.pack(side=tk.LEFT, padx=(3,0))
-            self.status_labels[key] = val
-        self.hint_label = tk.Label(sf, text='', bg='#f0f0f0',
-                                   font=('Microsoft YaHei', 8), fg='#e67e22', wraplength=280)
-        self.hint_label.pack(fill=tk.X, pady=(5,0))
+        for key, label in [('monitor','监控状态'),('mode','运行模式'),('current_chat','当前聊天'),
+                           ('last_message','最后检测消息'),('last_trigger','最后触发'),('last_send','最后发送')]:
+            row = tk.Frame(sc, bg=self.C['card']); row.pack(fill=tk.X, pady=2)
+            tk.Label(row, text=label+':', bg=self.C['card'], fg=self.C['text2'],
+                     font=('Microsoft YaHei UI', 8, 'bold'), width=12, anchor='e').pack(side=tk.LEFT)
+            val = tk.Label(row, text='-', bg=self.C['card'], fg=self.C['text'],
+                           font=('Microsoft YaHei UI', 8), anchor='w')
+            val.pack(side=tk.LEFT, padx=6); self.status_labels[key] = val
+        self.hint_label = tk.Label(sc, text='', bg=self.C['card'], fg=self.C['warning'],
+                                   font=('Microsoft YaHei UI', 8), wraplength=300)
+        self.hint_label.pack(fill=tk.X, pady=(5, 0))
 
-        # ---- 右侧: 编辑区 ----
-        right = tk.LabelFrame(main, text=' 添加/编辑规则 ', font=('Microsoft YaHei', 10),
-                             bg='#f0f0f0', padx=5, pady=5)
-        right.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5,0))
+        # ---- RIGHT CARD ----
+        r_out, rc = self._card(main, '添加 / 编辑规则')
+        r_out.pack(side=tk.RIGHT, fill=tk.BOTH, padx=(5, 0))
+        self._lbl(rc, '聊天对象名'); self.entry_chat = self._ent(rc)
+        self._lbl(rc, '触发关键词'); self.entry_keyword = self._ent(rc)
+        self._lbl(rc, '自动回复内容')
+        tf2 = tk.Frame(rc, bg=self.C['border'], padx=1, pady=1); tf2.pack(fill=tk.X, pady=(0, 5))
+        self.text_reply = tk.Text(tf2, font=('Microsoft YaHei UI', 10), height=5,
+                                  relief=tk.FLAT, bd=0, wrap=tk.WORD, bg='#F9FAFB',
+                                  fg=self.C['text'], insertbackground='#07C160')
+        self.text_reply.pack(fill=tk.X)
+        ebf = tk.Frame(rc, bg=self.C['card']); ebf.pack(fill=tk.X, pady=(8, 0))
+        self._btn(ebf, '添加规则', self._add_rule, 'primary', 'primary_hov', w=10).pack(side=tk.LEFT, padx=2)
+        self._btn(ebf, '更新选中', self._update_rule, 'blue', 'blue_hov', w=10).pack(side=tk.LEFT, padx=4)
+        self._btn(ebf, '清空', self._clear_form, 'text2', 'text2', w=8, fs=9).pack(side=tk.LEFT, padx=4)
 
-        tk.Label(right, text='聊天对象名:', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(5,2))
-        self.entry_chat = tk.Entry(right, font=('Microsoft YaHei', 10), relief=tk.SOLID, bd=1)
-        self.entry_chat.pack(fill=tk.X, ipady=3)
-
-        tk.Label(right, text='触发关键词:', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8,2))
-        self.entry_keyword = tk.Entry(right, font=('Microsoft YaHei', 10), relief=tk.SOLID, bd=1)
-        self.entry_keyword.pack(fill=tk.X, ipady=3)
-
-        tk.Label(right, text='自动回复内容:', bg='#f0f0f0',
-                 font=('Microsoft YaHei', 9), anchor='w').pack(fill=tk.X, pady=(8,2))
-        self.text_reply = tk.Text(right, font=('Microsoft YaHei', 10), height=4,
-                                  relief=tk.SOLID, bd=1, wrap=tk.WORD)
-        self.text_reply.pack(fill=tk.X, pady=(0,5))
-
-        brf = tk.Frame(right, bg='#f0f0f0')
-        brf.pack(fill=tk.X, pady=(5,0))
-        tk.Button(brf, text=' 添加规则 ', command=self._add_rule, bg='#27ae60', fg='white',
-                  font=('Microsoft YaHei', 10, 'bold'), relief=tk.FLAT, padx=12, pady=4
-                  ).pack(side=tk.LEFT, padx=2)
-        tk.Button(brf, text=' 更新选中 ', command=self._update_rule, bg='#2980b9', fg='white',
-                  font=('Microsoft YaHei', 10, 'bold'), relief=tk.FLAT, padx=12, pady=4
-                  ).pack(side=tk.LEFT, padx=2)
-        tk.Button(brf, text=' 清空 ', command=self._clear_form, bg='#95a5a6', fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, padx=8, pady=4
-                  ).pack(side=tk.LEFT, padx=2)
-
-        # ===== 底部: 控制 + 日志 =====
-        bottom = tk.Frame(self.root, bg='#f0f0f0')
-        bottom.pack(fill=tk.X, padx=8, pady=(0,5))
-
-        ctrl = tk.Frame(bottom, bg='#f0f0f0')
-        ctrl.pack(fill=tk.X, pady=(0,5))
-
-        self.btn_start_once = tk.Button(ctrl, text='  检测一次  ', command=self._start_once,
-                                        bg='#2980b9', fg='white',
-                                        font=('Microsoft YaHei', 10, 'bold'),
-                                        relief=tk.FLAT, padx=12, pady=5)
-        self.btn_start_loop = tk.Button(ctrl, text='  循环检测  ', command=self._start_loop,
-                                        bg='#27ae60', fg='white',
-                                        font=('Microsoft YaHei', 10, 'bold'),
-                                        relief=tk.FLAT, padx=12, pady=5)
-
-        self.btn_stop = tk.Button(ctrl, text='  停止  ', command=self._stop,
-                                  bg='#e74c3c', fg='white',
-                                  font=('Microsoft YaHei', 10, 'bold'),
-                                  relief=tk.FLAT, padx=12, pady=5, state=tk.DISABLED)
-
-        self.led = tk.Label(ctrl, text='O 已停止', font=('Microsoft YaHei', 10, 'bold'),
-                            bg='#f0f0f0', fg='#e74c3c')
-        self.led.pack(side=tk.LEFT, padx=15)
-
-        self.round_label = tk.Label(ctrl, text='',
-                                    font=('Microsoft YaHei', 9), bg='#f0f0f0', fg='#555')
+        # ========== BOTTOM: control + log ==========
+        bottom = tk.Frame(self.root, bg=self.C['bg'])
+        bottom.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 8))
+        c_out, cc = self._card(bottom); c_out.pack(fill=tk.X, pady=(0, 6))
+        ci = tk.Frame(cc, bg=self.C['card']); ci.pack(fill=tk.X, pady=2)
+        self.btn_start_once = self._btn(ci, '检测一次', self._start_once, 'blue', 'blue_hov', w=11)
+        self.btn_start_loop = self._btn(ci, '开始循环检测', self._start_loop, 'primary', 'primary_hov', w=11)
+        self.btn_stop = self._btn(ci, '停止监控', self._stop, 'danger', 'danger_hov', w=11)
+        self.btn_stop.pack_forget()
+        self.led = tk.Label(ci, text='O 已停止', font=('Microsoft YaHei UI', 11, 'bold'),
+                            bg=self.C['card'], fg=self.C['danger']); self.led.pack(side=tk.LEFT, padx=15)
+        self.round_label = tk.Label(ci, text='', font=('Microsoft YaHei UI', 9),
+                                    bg=self.C['card'], fg=self.C['text2'])
         self.round_label.pack(side=tk.LEFT, padx=10)
-
-        # 根据当前模式只显示对应按钮
         self._update_start_button()
 
-        # 日志
-        lgf = tk.LabelFrame(bottom, text=' 运行日志 ', font=('Microsoft YaHei', 9),
-                           bg='#f0f0f0', padx=3, pady=3)
-        lgf.pack(fill=tk.BOTH, expand=True)
+        # Log
+        _, lgc = self._card(bottom, '运行日志'); lgc.pack(fill=tk.BOTH, expand=True)
+        lbf = tk.Frame(lgc, bg=self.C['card']); lbf.pack(fill=tk.X, pady=(0, 4))
+        self._bsm(lbf, '清空日志', lambda: self.log_text.delete('1.0', tk.END) if self.log_text else None, 'text2', 'text2').pack(side=tk.LEFT, padx=1)
+        self._bsm(lbf, '复制日志', lambda: None, 'blue', 'blue_hov').pack(side=tk.LEFT, padx=3)
+        ltf = tk.Frame(lgc, bg=self.C['border'], padx=1, pady=1); ltf.pack(fill=tk.BOTH, expand=True)
         self.log_text = self.scrolledtext.ScrolledText(
-            lgf, font=('Consolas', 9), height=10, relief=tk.SOLID, bd=1,
-            wrap=tk.WORD, bg='#1e1e1e', fg='#d4d4d4')
+            ltf, font=('Cascadia Mono', 9), relief=tk.FLAT, bd=0,
+            wrap=tk.WORD, bg='#1A1E2B', fg='#D4D4D8', insertbackground='white')
         self.log_text.pack(fill=tk.BOTH, expand=True)
-        for tag, color in [('trigger','#f1c40f'),('reply','#2ecc71'),('error','#e74c3c'),
-                           ('info','#3498db'),('skip','#95a5a6'),('poll','#8e44ad')]:
-            self.log_text.tag_configure(tag, foreground=color)
+        for t, c in [('trigger','#FACC15'),('reply','#4ADE80'),('error','#F87171'),
+                     ('info','#60A5FA'),('skip','#9CA3AF'),('poll','#A78BFA')]:
+            self.log_text.tag_configure(t, foreground=c)
 
     # ===== UI 逻辑 =====
 
@@ -1251,35 +1225,25 @@ class AutoReplyUI:
         self.text_reply.delete('1.0', self.tk.END)
 
     def _add_rule(self):
-        c = self.entry_chat.get().strip()
-        k = self.entry_keyword.get().strip()
+        c = self.entry_chat.get().strip(); k = self.entry_keyword.get().strip()
         r = self.text_reply.get('1.0', self.tk.END).strip()
         if not c or not k or not r:
-            self.messagebox.showwarning('提示', '请填写完整')
-            return
-        self.engine.add_rule(c, k, r)
-        self._refresh_rules_tree()
-        self._clear_form()
-        self._update_hint()
+            self.messagebox.showwarning('提示', '聊天对象、关键词、回复内容不能为空'); return
+        self.engine.add_rule(c, k, r); self._refresh_rules_tree(); self._clear_form(); self._update_hint()
 
     def _update_rule(self):
         sel = self.rules_tree.selection()
-        if not sel: return
+        if not sel:
+            self.messagebox.showwarning('提示', '请先在左侧选中一条规则'); return
         idx = int(sel[0])
         if idx >= len(self.engine.rules): return
-        c = self.entry_chat.get().strip()
-        k = self.entry_keyword.get().strip()
+        c = self.entry_chat.get().strip(); k = self.entry_keyword.get().strip()
         r = self.text_reply.get('1.0', self.tk.END).strip()
         if not c or not k or not r:
-            self.messagebox.showwarning('提示', '请填写完整')
-            return
+            self.messagebox.showwarning('提示', '聊天对象、关键词、回复内容不能为空'); return
         with self.engine._lock:
-            self.engine.rules[idx].chat = c
-            self.engine.rules[idx].keyword = k
-            self.engine.rules[idx].reply = r
-        self.engine.save_config()
-        self._refresh_rules_tree()
-        self._clear_form()
+            self.engine.rules[idx].chat = c; self.engine.rules[idx].keyword = k; self.engine.rules[idx].reply = r
+        self.engine.save_config(); self._refresh_rules_tree(); self._clear_form()
         self.engine.log('更新规则#{}: {} | {}'.format(idx+1, c, k))
 
     def _del_rule(self):
@@ -1322,18 +1286,12 @@ class AutoReplyUI:
         self._set_ui_stopped()
 
     def _set_ui_running(self):
-        if self.engine.mode == 'loop':
-            self.btn_start_loop.config(state=self.tk.DISABLED)
-        else:
-            self.btn_start_once.config(state=self.tk.DISABLED)
-        self.btn_stop.config(state=self.tk.NORMAL)
+        self.btn_start_once.pack_forget(); self.btn_start_loop.pack_forget(); self.btn_stop.pack_forget()
+        self.btn_stop.pack(side=self.tk.LEFT, padx=3)
+        self.led.pack_forget(); self.led.pack(side=self.tk.LEFT, padx=15)
 
     def _set_ui_stopped(self):
-        if self.engine.mode == 'loop':
-            self.btn_start_loop.config(state=self.tk.NORMAL)
-        else:
-            self.btn_start_once.config(state=self.tk.NORMAL)
-        self.btn_stop.config(state=self.tk.DISABLED)
+        self.btn_stop.pack_forget(); self._update_start_button()
 
     def _save_preset(self):
         name = self.simpledialog.askstring('保存预设', '预设名称:')
@@ -1406,30 +1364,24 @@ class AutoReplyUI:
         self.root.wait_window(dialog)
 
     def _update_status(self):
-        st = self.engine.status
-        labels = self.status_labels
+        st = self.engine.status; labels = self.status_labels
         running = self.engine.monitor_running
         labels['monitor'].config(text='运行中' if running else '已停止',
-                                 fg='#27ae60' if running else '#e74c3c')
+                                 fg=self.C['primary'] if running else self.C['danger'])
+        self.header_badge.config(text='运行中' if running else '已停止',
+                                 bg=self.C['primary'] if running else self.C['danger'])
         self.led.config(text='O 运行中' if running else 'O 已停止',
-                        fg='#27ae60' if running else '#e74c3c')
+                        fg=self.C['primary'] if running else self.C['danger'])
         labels['mode'].config(text=st.get('mode','-'))
         labels['current_chat'].config(text=(st.get('current_chat','-') or '-')[:25])
         labels['last_message'].config(text=(st.get('last_message','-') or '-')[:30])
         labels['last_trigger'].config(text=(st.get('last_trigger','-') or '-')[:30])
         labels['last_send'].config(text=(st.get('last_send','-') or '-')[:20])
-
-        round_num = st.get('round',0)
-        total = st.get('total_rounds',0)
-        if running and total == '-':
-            self.round_label.config(text='第{}轮'.format(round_num))
-        elif running:
-            self.round_label.config(text='第{}/{}轮'.format(round_num, total))
-        else:
-            self.round_label.config(text='')
-
-        if not running:
-            self._set_ui_stopped()
+        rn = st.get('round',0); total = st.get('total_rounds',0)
+        if running and total == '-': self.round_label.config(text='第 {} 轮'.format(rn))
+        elif running: self.round_label.config(text='第 {}/{} 轮'.format(rn, total))
+        else: self.round_label.config(text='')
+        if not running: self._set_ui_stopped()
         self._update_hint()
         self.root.after(1000, self._update_status)
 
@@ -1437,15 +1389,13 @@ class AutoReplyUI:
         enabled = sum(1 for r in self.engine.rules if r.enabled)
         running = self.engine.monitor_running
         if enabled and not running:
-            self.hint_label.config(
-                text='已配置{}条规则，点击[检测一次]或[循环检测]开始'.format(enabled))
+            self.hint_label.config(text='已配置 {} 条规则，点击启动按钮开始'.format(enabled))
         elif not enabled:
-            self.hint_label.config(text='还没有规则，请先在右侧添加并启用。')
+            self.hint_label.config(text='还没有添加规则，请先在右侧填写并添加')
         elif running:
-            mode = '循环' if self.engine.mode=='loop' else '单次'
-            self.hint_label.config(text='{}检测中，{}条规则启用。'.format(mode, enabled))
-        else:
-            self.hint_label.config(text='')
+            m = '循环' if self.engine.mode=='loop' else '单次'
+            self.hint_label.config(text='{} 检测中，{} 条规则启用'.format(m, enabled))
+        else: self.hint_label.config(text='')
 
     def _pull_logs(self):
         if not self.log_text or not self.root: return
