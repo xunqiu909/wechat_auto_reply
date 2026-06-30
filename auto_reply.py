@@ -200,8 +200,8 @@ class MonitorEngine:
         self.log_queue = queue.Queue()
 
         self.baseline_ids = {}
-        self.replied_hashes = {}
-        self.sent_texts = set()
+        self.last_incoming = {}   # {chat: text} 上次已回复的 incoming 消息文本
+        self.sent_texts = set()   # 自己发过的文本(防循环)
         self.stop_requested = False  # 用于 Ctrl+C / 超时 / 手动停止
 
         self.status = {
@@ -479,7 +479,7 @@ class MonitorEngine:
         focus_wechat()
         time.sleep(0.3)
         self.baseline_ids.clear()
-        self.replied_hashes.clear()
+        self.last_incoming.clear()
         self.sent_texts.clear()
         self.stop_requested = False
         self.status = {
@@ -600,10 +600,8 @@ class MonitorEngine:
                     self.log('[SKIP] 规则#{} 聊天不匹配: 期望[{}] 实际[{}]'.format(idx+1, chat, cur_name))
                 continue
 
-            # 初始化去重(共用)
-            if chat not in self.replied_hashes:
-                self.replied_hashes[chat] = set()
-            replied = self.replied_hashes[chat]
+            # 初始化
+            prev_text = self.last_incoming.get(chat, '')
 
             # 从最新消息快照中提取所有 incoming 消息(逆序)
             incoming_msgs = []
@@ -615,29 +613,34 @@ class MonitorEngine:
                     continue
                 incoming_msgs.append(msg)
 
-            # 对每条规则测试这个快照
+            if not incoming_msgs:
+                for idx, _ in rule_list:
+                    self.log('[POLL] 规则#{} 聊天: {} 无 incoming 消息'.format(idx+1, chat))
+                continue
+
+            # 取最新 incoming
+            msg = incoming_msgs[0]
+            latest_text = msg.name.strip()
+            self.status['last_message'] = latest_text[:60]
+            self.log('[POLL] 聊天: {} latest incoming: {!r}'.format(chat, latest_text[:60]))
+
+            # 去重: 如果最新 incoming 文本和上次一模一样, 跳过(不再重复回复)
+            if latest_text == prev_text:
+                self.log('[DEDUP] latest={!r} == prev={!r} -> SKIP'.format(
+                    self._normalize(latest_text)[:30], self._normalize(prev_text)[:30]))
+                continue
+
+            # 新 incoming 出现了 → 对每条规则测试
             for idx, rule in rule_list:
                 if self.stop_requested: break
-                if not incoming_msgs:
-                    self.log('[POLL] 规则#{} 聊天: {} 无 incoming 消息'.format(idx+1, chat))
-                    continue
-
-                # 取最新 incoming
-                msg = incoming_msgs[0]
-                self.status['last_message'] = msg.name[:60]
-                self.log('[POLL] 规则#{} 聊天: {} incoming: {!r}'.format(idx+1, chat, msg.name[:60]))
-
-                # 去重(同快照内同 rid 不重复回复)
-                if msg.runtime_id in replied:
-                    self.log('[DEDUP] 已回复过 rid={} -> SKIP'.format(msg.runtime_id[:16]))
-                    continue
-                self.log('[DEDUP] new=True rid={}'.format(msg.runtime_id[:16]))
 
                 # 关键词匹配
                 if not self._match_kw(msg.name, rule.keyword):
-                    self.log('[MATCH] kw={!r} msg={!r} -> False'.format(rule.keyword, self._normalize(msg.name)[:25]))
+                    self.log('[MATCH] 规则#{} kw={!r} msg={!r} -> False'.format(
+                        idx+1, rule.keyword, self._normalize(msg.name)[:25]))
                     continue
-                self.log('[MATCH] kw={!r} msg={!r} -> True'.format(rule.keyword, self._normalize(msg.name)[:25]))
+                self.log('[MATCH] 规则#{} kw={!r} msg={!r} -> True'.format(
+                    idx+1, rule.keyword, self._normalize(msg.name)[:25]))
 
                 # 回复内容非空
                 if not rule.reply.strip():
@@ -659,9 +662,8 @@ class MonitorEngine:
                 self.status['last_send'] = '成功' if ok else '失败'
                 if ok:
                     self.log('[REPLY] -> [{}]: {}'.format(chat, rule.reply[:40]))
-                replied.add(msg.runtime_id)
-                if len(replied) > 300:
-                    self.replied_hashes[chat] = set(list(replied)[-150:])
+                    # 记录已回复, 下次同一文本不再回
+                    self.last_incoming[chat] = latest_text
 
                 # 一条消息只匹配一次(即使同一聊天多条规则, 只回复第一条匹配的)
                 break
