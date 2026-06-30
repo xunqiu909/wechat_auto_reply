@@ -889,12 +889,12 @@ class AutoReplyUI:
         self.root = None
         self.log_text = None
 
-    def _btn(self, parent, text, cmd, color, hcolor, w=11, fs=10):
+    def _btn(self, parent, text, cmd, color, hcolor, w=9, fs=10):
         tk = self.tk; c=self.C.get(color,color); hc=self.C.get(hcolor,hcolor)
         b = tk.Frame(parent, bg=self.C['border'], cursor='hand2', padx=1, pady=1)
         i = tk.Frame(b, bg=c); i.pack(fill=tk.BOTH, expand=True)
         l = tk.Label(i, text=text, bg=c, fg='white',
-                     font=('Microsoft YaHei UI', fs, 'bold'), padx=w, pady=4)
+                     font=('Microsoft YaHei UI', fs, 'bold'), padx=w, pady=3)
         l.pack()
         def cb(e): cmd()
         def en(e): i.configure(bg=hc); l.configure(bg=hc)
@@ -954,8 +954,8 @@ class AutoReplyUI:
 
         self.root = tk.Tk()
         self.root.title('wxauto 自动回复监控')
-        self.root.geometry('900x780')
-        self.root.minsize(820, 600)
+        self.root.geometry('920x820')
+        self.root.minsize(850, 650)
         self.root.configure(bg=self.C['bg'])
 
         self._build_ui()
@@ -1038,7 +1038,7 @@ class AutoReplyUI:
                 foreground=[('selected', self.C['text'])])
         cols = ('status', 'chat', 'keyword', 'reply')
         self.rules_tree = tk.ttk.Treeview(tree_frame, columns=cols, show='headings',
-                                          height=8, selectmode='browse', style='R.Treeview')
+                                          height=10, selectmode='browse', style='R.Treeview')
         self.rules_tree.heading('status', text='状态'); self.rules_tree.column('status', width=45, anchor='center')
         self.rules_tree.heading('chat', text='聊天对象'); self.rules_tree.column('chat', width=110)
         self.rules_tree.heading('keyword', text='关键词'); self.rules_tree.column('keyword', width=75)
