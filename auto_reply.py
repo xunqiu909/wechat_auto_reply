@@ -105,6 +105,18 @@ class FreshNav:
         return chat_name, lst.GetChildren()
 
     @staticmethod
+    def get_search_edit():
+        """返回搜索框 EditControl"""
+        sp = FreshNav._nav_splitter()
+        if not sp: return None
+        lefts = [c for c in sp.GetChildren() if c.ClassName=='mmui::XView']
+        if not lefts: return None
+        cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
+        cl = cmv.GroupControl(ClassName='mmui::XView')
+        sf = cl.GroupControl(ClassName='mmui::XSearchField')
+        return sf.EditControl(ClassName='mmui::XValidatorTextEdit')
+
+    @staticmethod
     def get_session_table():
         sp = FreshNav._nav_splitter()
         if not sp: return None
@@ -375,6 +387,44 @@ class MonitorEngine:
                 seen.update(cur_set)
                 table.WheelDown(wheelTimes=10, waitTime=0.01, interval=0.01)
                 time.sleep(0.15)
+
+        # 滚动没找到 → 搜索框
+        self.log('[SEARCH] 滚动未找到 {}, 使用搜索框'.format(who[:10]))
+        try:
+            search_edit = FreshNav.get_search_edit()
+            if search_edit:
+                search_edit.Click(simulateMove=False)
+                time.sleep(0.1)
+                # 清空 + 输入
+                search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
+                time.sleep(0.08)
+                # 用剪贴板输入(比 SendKeys 更可靠)
+                pyperclip.copy(who)
+                time.sleep(0.05)
+                search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
+                time.sleep(0.5)
+
+                # 重新获取会话列表(搜索后应该过滤了)
+                table = FreshNav.get_session_table()
+                if table:
+                    items = table.GetChildren()
+                    if items:
+                        first = items[0]
+                        r = first.BoundingRectangle
+                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+                        time.sleep(0.25)
+                        # 清除搜索框
+                        try:
+                            search_edit.SendKeys('{Ctrl}a{Back}')
+                        except: pass
+                        return FreshNav._nav_splitter() is not None
+
+                # 清除搜索框
+                try:
+                    search_edit.SendKeys('{Ctrl}a{Back}')
+                except: pass
+        except Exception as e:
+            self.log('[SEARCH] 搜索异常: {}'.format(e))
 
         return False
 
