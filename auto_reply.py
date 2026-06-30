@@ -5,12 +5,92 @@ wxauto 4.1 自动回复监控系统 v4
 多规则: 每规则独立 (聊天+关键词+回复)
 预设: 保存/加载/删除 配置快照
 """
-import sys, os, json, time, threading, queue, hashlib, copy
+import sys, os, json, time, threading, queue, hashlib, copy, ctypes
+from ctypes import wintypes
 from datetime import datetime
 
 import pyperclip
 import win32gui, win32con, win32api
 import uiautomation as uia
+
+# ==================== 全局热键 ====================
+
+# Windows API
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+
+VK_Q     = 0x51
+VK_F12   = 0x7B
+WM_HOTKEY = 0x0312
+
+class GlobalHotkey:
+    """Win32 全局热键 — 无论焦点在哪都能响应"""
+    _instance = None
+    _callbacks = {}
+    _next_id = 1
+    _hwnd = None
+
+    @classmethod
+    def register(cls, modifiers, vk, callback):
+        """注册全局热键, 返回 hotkey_id"""
+        if cls._instance is None:
+            cls._instance = cls._create_window()
+
+        hkid = cls._next_id
+        cls._next_id += 1
+        cls._callbacks[hkid] = callback
+
+        ok = ctypes.windll.user32.RegisterHotKey(
+            cls._hwnd, hkid, modifiers, vk)
+        if not ok:
+            raise RuntimeError('RegisterHotKey failed')
+        return hkid
+
+    @classmethod
+    def unregister(cls, hkid):
+        ctypes.windll.user32.UnregisterHotKey(cls._hwnd, hkid)
+        cls._callbacks.pop(hkid, None)
+
+    @classmethod
+    def pump(cls):
+        """在自己的线程里跑, 持续处理 WM_HOTKEY 直到窗口销毁"""
+        msg = wintypes.MSG()
+        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), cls._hwnd, 0, 0):
+            if msg.message == WM_HOTKEY:
+                cb = cls._callbacks.get(msg.wParam)
+                if cb:
+                    threading.Thread(target=cb, daemon=True).start()
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+
+    @classmethod
+    def stop(cls):
+        if cls._hwnd:
+            ctypes.windll.user32.PostMessageW(cls._hwnd, 0x0010, 0, 0)  # WM_CLOSE
+
+    @classmethod
+    def _wnd_proc(cls, hwnd, msg, wparam, lparam):
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    @staticmethod
+    def _create_window():
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p,
+                                      ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_longlong)
+        proc = WNDPROC(GlobalHotkey._wnd_proc)
+
+        wc = wintypes.WNDCLASSW()
+        wc.lpfnWndProc = proc
+        wc.lpszClassName = 'AutoReplyHotkeyWindow'
+        wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        atom = ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
+
+        hwnd = ctypes.windll.user32.CreateWindowExW(
+            0, ctypes.cast(atom, wintypes.LPCWSTR), '', 0,
+            0, 0, 0, 0, 0, 0, wc.hInstance, None)
+        GlobalHotkey._hwnd = hwnd
+        return hwnd
 
 
 # ==================== COM / 底层工具 ====================
@@ -531,6 +611,18 @@ class MonitorEngine:
         self.monitor_running = True
         self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
+
+        # 注册全局热键 Ctrl+F12 强制停止 — 即使微信窗口在前台也有效(只注册一次)
+        if not hasattr(MonitorEngine, '_hotkey_hkid'):
+            try:
+                _stop_self = self.stop
+                MonitorEngine._hotkey_hkid = GlobalHotkey.register(
+                    MOD_CONTROL, VK_F12, lambda: _stop_self())
+                threading.Thread(target=GlobalHotkey.pump, daemon=True).start()
+                self.log('[HOTKEY] Ctrl+F12 已在全局注册(随时可强制停止)')
+            except Exception as e:
+                self.log('[HOTKEY] 注册失败: {}'.format(e))
+
         if self.mode == 'loop':
             self.log('[START] 模式: 循环 | 激活{}秒/暂停{}秒 | 间隔{}秒 | 规则: {}条'.format(
                 self.active_duration, self.pause_duration, self.poll_interval,

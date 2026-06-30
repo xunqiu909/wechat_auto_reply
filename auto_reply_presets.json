@@ -1,0 +1,28 @@
+{
+  "拿下6元": {
+    "mode": "loop",
+    "poll_interval": 0.1,
+    "active_duration": 15,
+    "pause_duration": 2,
+    "rules": [
+      {
+        "chat": "拿下6元",
+        "keyword": "6元",
+        "reply": "1",
+        "enabled": true
+      },
+      {
+        "chat": "拿下6元",
+        "keyword": "所有人",
+        "reply": "收到收到",
+        "enabled": true
+      },
+      {
+        "chat": "拿下6元",
+        "keyword": "同学们",
+        "reply": "买买买",
+        "enabled": true
+      }
+    ]
+  }
+}
