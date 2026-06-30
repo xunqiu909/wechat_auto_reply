@@ -331,15 +331,13 @@ class MonitorEngine:
     # ---- 核心操作 ----
 
     def _open_chat(self, who):
-        """打开指定会话。如果已经在目标聊天则跳过"""
+        """打开指定会话: 可见列表→慢速翻页→搜索框"""
         init_com()
-        uia.SetGlobalSearchTimeout(3)
+        focus_wechat()
+        time.sleep(0.05)
+        uia.SetGlobalSearchTimeout(2)
 
-        # 快速路径: 从status检查当前是否已经在目标聊天
-        if self.status.get('current_chat', '') == who:
-            return True
-
-        # 真正UIA快速检查(仅查当前聊天名,不取消息列表)
+        # 快速路径: 当前已是目标聊天
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
@@ -347,86 +345,129 @@ class MonitorEngine:
                 return True
         except: pass
 
-        focus_wechat()
-        time.sleep(0.05)
-
-        # 先在可见列表中快速查找
+        # ---- 方法1: 可见列表 + 慢速翻页扫描 ----
         table = FreshNav.get_session_table()
-        if table:
+        if not table:
+            return False
+
+        # 先滚到顶
+        for _ in range(25):
+            table.WheelUp(wheelTimes=20, waitTime=0.002, interval=0.002)
+        time.sleep(0.15)
+
+        seen = set()
+        for scan in range(30):
+            table = FreshNav.get_session_table()
+            if not table: break
             items = table.GetChildren()
+            cur = set()
             for item in items:
                 n = item.Name.split('\n')[0]
+                cur.add(n)
                 if who == n:
                     r = item.BoundingRectangle
                     mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                    time.sleep(0.25)
+                    time.sleep(0.2)
                     return FreshNav._nav_splitter() is not None
+            if cur.issubset(seen): break
+            seen.update(cur)
+            # 慢速翻: 每次6个 wheel, 间隔更长
+            table.WheelDown(wheelTimes=6, waitTime=0.02, interval=0.015)
+            time.sleep(0.2)
 
-        # 没在可见列表，快速上滚扫描
-        if table:
-            for _ in range(5):
-                table.WheelUp(wheelTimes=10, waitTime=0.01, interval=0.01)
-                time.sleep(0.02)
-            time.sleep(0.1)
+        # ---- 方法2: 搜索框 ----
+        self.log('[SEARCH] 滚动未找到 {}, 用搜索框'.format(who[:10]))
+        search_edit = FreshNav.get_search_edit()
+        if not search_edit:
+            return False
 
-            seen = set()
-            for _ in range(10):
-                table = FreshNav.get_session_table()
-                if not table: return False
-                items = table.GetChildren()
-                cur_set = set()
-                for item in items:
-                    n = item.Name.split('\n')[0]
-                    cur_set.add(n)
-                    if who == n:
-                        r = item.BoundingRectangle
-                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.25)
-                        return FreshNav._nav_splitter() is not None
-                if cur_set.issubset(seen): break
-                seen.update(cur_set)
-                table.WheelDown(wheelTimes=10, waitTime=0.01, interval=0.01)
-                time.sleep(0.15)
+        # 点击搜索框并输入
+        search_edit.Click(simulateMove=False)
+        time.sleep(0.1)
+        search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
+        time.sleep(0.05)
+        pyperclip.copy(who)
+        time.sleep(0.05)
+        search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
+        time.sleep(0.8)
 
-        # 滚动没找到 → 搜索框
-        self.log('[SEARCH] 滚动未找到 {}, 使用搜索框'.format(who[:10]))
+        # 检查搜索结果区域是否有"群聊"/"联系人"标签(部分微信版本)
         try:
-            search_edit = FreshNav.get_search_edit()
-            if search_edit:
-                search_edit.Click(simulateMove=False)
-                time.sleep(0.1)
-                # 清空 + 输入
-                search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
-                time.sleep(0.08)
-                # 用剪贴板输入(比 SendKeys 更可靠)
-                pyperclip.copy(who)
-                time.sleep(0.05)
-                search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
-                time.sleep(0.5)
-
-                # 重新获取会话列表(搜索后应该过滤了)
-                table = FreshNav.get_session_table()
-                if table:
-                    items = table.GetChildren()
-                    if items:
-                        first = items[0]
-                        r = first.BoundingRectangle
-                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.25)
-                        # 清除搜索框
-                        try:
-                            search_edit.SendKeys('{Ctrl}a{Back}')
-                        except: pass
-                        return FreshNav._nav_splitter() is not None
-
-                # 清除搜索框
-                try:
-                    search_edit.SendKeys('{Ctrl}a{Back}')
-                except: pass
+            left_part = FreshNav._nav_splitter()
+            if left_part:
+                left_panel = [c for c in left_part.GetChildren() if c.ClassName=='mmui::XView'][0]
+                cmv = left_panel.GroupControl(ClassName='mmui::ChatMasterView')
+                cli = cmv.GroupControl(ClassName='mmui::XView')
+                # 查找所有 Button/Text 控件, 找"群聊""联系人""聊天记录"等标签
+                def _find_tabs(ele, res):
+                    try:
+                        if ele.ControlTypeName in ('ButtonControl','TextControl','TabItemControl'):
+                            n = ele.Name or ''
+                            if any(k in n for k in ['群聊','联系人','聊天记录']):
+                                res.append(ele)
+                        for c in ele.GetChildren():
+                            _find_tabs(c, res)
+                    except: pass
+                tabs = []
+                _find_tabs(cli, tabs)
+                if tabs:
+                    self.log('[SEARCH] 找到标签: {}'.format([t.Name for t in tabs]))
+                    # 点击"群聊"或"联系人"(优先群聊)
+                    for tab in tabs:
+                        if '群聊' in (tab.Name or ''):
+                            tab.Click(simulateMove=False)
+                            time.sleep(0.2)
+                            break
+                    else:
+                        tabs[0].Click(simulateMove=False)
+                        time.sleep(0.2)
         except Exception as e:
-            self.log('[SEARCH] 搜索异常: {}'.format(e))
+            self.log('[SEARCH] 标签检测异常: {}'.format(e))
 
-        return False
+        # 获取搜索结果
+        table = FreshNav.get_session_table()
+        if not table:
+            try:
+                search_edit.SendKeys('{Ctrl}a{Back}')
+            except: pass
+            return False
+
+        items = table.GetChildren()
+        if not items:
+            self.log('[SEARCH] 搜索无结果')
+            try:
+                search_edit.SendKeys('{Ctrl}a{Back}')
+            except: pass
+            return False
+
+        # 在搜索结果中按名称匹配
+        best = None
+        for item in items:
+            n = item.Name.split('\n')[0]
+            if who == n:
+                best = item
+                break
+            if who in n or n in who:
+                if best is None:
+                    best = item
+
+        if best is None:
+            # 都不匹配就用第一个
+            best = items[0]
+
+        n = best.Name.split('\n')[0]
+        self.log('[SEARCH] 点击: {}'.format(n[:30]))
+        r = best.BoundingRectangle
+        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+        time.sleep(0.2)
+
+        # 清除搜索框
+        try:
+            search_edit.SendKeys('{Ctrl}a{Back}')
+        except: pass
+        time.sleep(0.1)
+
+        return FreshNav._nav_splitter() is not None
 
     def _send_reply(self, text):
         init_com()
