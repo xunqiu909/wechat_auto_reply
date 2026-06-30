@@ -319,42 +319,56 @@ class MonitorEngine:
     # ---- 核心操作 ----
 
     def _open_chat(self, who):
+        """打开指定会话。如果已经在目标聊天则跳过"""
         init_com()
-        focus_wechat()
-        time.sleep(0.15)
         uia.SetGlobalSearchTimeout(3)
+
+        # 快速路径: 检查当前是否已经在目标聊天
+        cur, _ = FreshNav.get_message_items()
+        if cur and cur.strip() == who.strip():
+            return True
+
+        focus_wechat()
+        time.sleep(0.08)
+
+        # 先在可见列表中快速查找
         table = FreshNav.get_session_table()
         if table:
-            for _ in range(20):
-                table.WheelUp(wheelTimes=15, waitTime=0.01, interval=0.01)
+            items = table.GetChildren()
+            for item in items:
+                n = item.Name.split('\n')[0]
+                if who == n:
+                    r = item.BoundingRectangle
+                    mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+                    time.sleep(0.25)
+                    return FreshNav._nav_splitter() is not None
+
+        # 没在可见列表，快速上滚扫描
+        if table:
+            for _ in range(5):
+                table.WheelUp(wheelTimes=10, waitTime=0.01, interval=0.01)
                 time.sleep(0.02)
-            time.sleep(0.25)
-        seen = set()
-        for direction in ['down', 'up']:
-            for _ in range(12):
+            time.sleep(0.1)
+
+            seen = set()
+            for _ in range(10):
                 table = FreshNav.get_session_table()
                 if not table: return False
                 items = table.GetChildren()
-                cur = set()
+                cur_set = set()
                 for item in items:
                     n = item.Name.split('\n')[0]
-                    cur.add(n)
+                    cur_set.add(n)
                     if who == n:
                         r = item.BoundingRectangle
                         mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.6)
-                        if FreshNav._nav_splitter():
-                            return True
-                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.5)
+                        time.sleep(0.25)
                         return FreshNav._nav_splitter() is not None
-                if cur.issubset(seen): break
-                seen.update(cur)
-                if direction == 'down':
-                    table.WheelDown(wheelTimes=15, waitTime=0.01, interval=0.01)
-                else:
-                    table.WheelUp(wheelTimes=15, waitTime=0.01, interval=0.01)
-                time.sleep(0.25)
+                if cur_set.issubset(seen): break
+                seen.update(cur_set)
+                table.WheelDown(wheelTimes=10, waitTime=0.01, interval=0.01)
+                time.sleep(0.15)
+
         return False
 
     def _send_reply(self, text):
@@ -363,16 +377,14 @@ class MonitorEngine:
         if not rect:
             self.log('[SEND] 找不到输入框')
             return False
-        self.log('[SEND] 点击输入框')
         mouse_click((rect[0]+rect[2])//2, (rect[1]+rect[3])//2)
-        time.sleep(0.15)
-        self.log('[SEND] 粘贴: {}'.format(text[:40]))
-        pyperclip.copy(text)
         time.sleep(0.08)
-        uia.SendKeys('{Ctrl}v', waitTime=0.05)
-        time.sleep(0.15)
-        uia.SendKeys('{Enter}', waitTime=0.05)
-        time.sleep(0.15)
+        pyperclip.copy(text)
+        time.sleep(0.05)
+        uia.SendKeys('{Ctrl}v', waitTime=0.03)
+        time.sleep(0.08)
+        uia.SendKeys('{Enter}', waitTime=0.03)
+        time.sleep(0.08)
         self.sent_texts.add(text.strip())
         self.log('[SEND] 成功')
         return True
@@ -432,8 +444,8 @@ class MonitorEngine:
         return True
 
     def stop(self):
-        if not self.monitor_running: return
         self.stop_requested = True
+        if not self.monitor_running: return
         self.monitor_running = False
         if self._thread:
             self._thread.join(timeout=5)
@@ -511,19 +523,24 @@ class MonitorEngine:
 
     def _poll_all_rules(self, rules, is_once):
         """遍历所有规则检查并回复"""
+        last_chat = None
         for idx, rule in enumerate(rules):
             if self.stop_requested:
                 break
-            self._process_rule(rule, idx, is_once)
+            # 如果和上一条规则目标相同，跳过重复打开
+            skip_open = (last_chat == rule.chat)
+            self._process_rule(rule, idx, is_once, skip_open)
+            last_chat = rule.chat
 
-    def _process_rule(self, rule, idx, is_once):
+    def _process_rule(self, rule, idx, is_once, skip_open=False):
         """处理单条规则"""
-        # 1. 打开聊天
-        if not self._open_chat(rule.chat):
-            self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, rule.chat))
-            self.status['last_trigger'] = '打开聊天失败'
-            return
-        time.sleep(0.4)
+        # 1. 打开聊天 (如果同聊天可跳过)
+        if not skip_open:
+            if not self._open_chat(rule.chat):
+                self.log('[SKIP] 规则#{} 无法打开: {}'.format(idx+1, rule.chat))
+                self.status['last_trigger'] = '打开聊天失败'
+                return
+            time.sleep(0.2)
 
         # 2. 获取消息
         cur_name, items = FreshNav.get_message_items()
@@ -665,6 +682,20 @@ class AutoReplyUI:
             try: self.root.destroy()
             except: pass
         self.root.protocol('WM_DELETE_WINDOW', on_close)
+
+        # Ctrl+C 强制停止
+        def force_stop(e=None):
+            self.engine.log('[CTRL+C] 强制中断')
+            self.engine.stop()
+        self.root.bind_all('<Control-c>', force_stop)
+
+        # 系统 signal (控制台 Ctrl+C, 即使窗口未聚焦也生效)
+        try:
+            import signal
+            signal.signal(signal.SIGINT, lambda sig, frame: force_stop())
+        except:
+            pass
+
         self.root.mainloop()
 
     def _build_ui(self):
@@ -965,11 +996,11 @@ class AutoReplyUI:
             self.messagebox.showwarning('错误', '暂停时长必须是 >=0 的整数')
             return
         try:
-            v = int(self.entry_interval.get().strip())
-            if v < 1: raise ValueError
+            v = float(self.entry_interval.get().strip())
+            if v < 0: raise ValueError
             self.engine.poll_interval = v
         except:
-            self.messagebox.showwarning('错误', '间隔必须是 >=1 的整数')
+            self.messagebox.showwarning('错误', '间隔必须是 >=0 的数字')
             return
         self.engine.save_config()
         self.engine.log('[CONFIG] 激活{}秒/暂停{}秒 间隔{}秒'.format(a, p, v))
@@ -1206,6 +1237,15 @@ class AutoReplyUI:
         print()
         print('命令: once | loop | start | stop | quit | add:聊天|关键词|回复')
         print('      del:# | toggle:# | preset:save:name | preset:load:name')
+        print('      按 Ctrl+C 可强制停止')
+        # Ctrl+C 信号处理
+        def _sigint(sig, frame):
+            self.engine.log('[CTRL+C] 强制中断')
+            self.engine.stop()
+        try:
+            import signal
+            signal.signal(signal.SIGINT, _sigint)
+        except: pass
         def log_printer():
             while self.engine.monitor_running or not self.engine.log_queue.empty():
                 try: print(self.engine.log_queue.get(timeout=0.5))
@@ -1214,7 +1254,10 @@ class AutoReplyUI:
         while True:
             try: cmd = input('>> ').strip()
             except (EOFError, KeyboardInterrupt):
-                self.engine.stop(); break
+                self.engine.stop_requested = True
+                self.engine.monitor_running = False
+                self.engine.stop()
+                break
             if not cmd: continue
             if cmd == 'quit': self.engine.stop(); break
             if cmd == 'once': self.engine.start('once'); continue
