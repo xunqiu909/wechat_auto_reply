@@ -5,7 +5,7 @@ wxauto 4.1 自动回复监控系统 v4
 多规则: 每规则独立 (聊天+关键词+回复)
 预设: 保存/加载/删除 配置快照
 """
-import sys, os, json, time, threading, queue, hashlib, copy, ctypes
+import sys, os, json, time, threading, queue, hashlib, copy, ctypes, signal
 from ctypes import wintypes
 from datetime import datetime
 
@@ -26,71 +26,48 @@ VK_F12   = 0x7B
 WM_HOTKEY = 0x0312
 
 class GlobalHotkey:
-    """Win32 全局热键 — 无论焦点在哪都能响应"""
-    _instance = None
+    """Win32 全局热键 — 用 ctypes 直接调 API"""
     _callbacks = {}
-    _next_id = 1
-    _hwnd = None
+    _next_id = 0
+    _running = False
 
     @classmethod
     def register(cls, modifiers, vk, callback):
-        """注册全局热键, 返回 hotkey_id"""
-        if cls._instance is None:
-            cls._instance = cls._create_window()
-
-        hkid = cls._next_id
         cls._next_id += 1
+        hkid = cls._next_id
         cls._callbacks[hkid] = callback
 
-        ok = ctypes.windll.user32.RegisterHotKey(
-            cls._hwnd, hkid, modifiers, vk)
+        ok = ctypes.windll.user32.RegisterHotKey(None, hkid, modifiers, vk)
         if not ok:
-            raise RuntimeError('RegisterHotKey failed')
+            raise RuntimeError('RegisterHotKey failed (err={})'.format(
+                ctypes.windll.kernel32.GetLastError()))
         return hkid
 
     @classmethod
     def unregister(cls, hkid):
-        ctypes.windll.user32.UnregisterHotKey(cls._hwnd, hkid)
+        ctypes.windll.user32.UnregisterHotKey(None, hkid)
         cls._callbacks.pop(hkid, None)
 
     @classmethod
     def pump(cls):
-        """在自己的线程里跑, 持续处理 WM_HOTKEY 直到窗口销毁"""
+        """在自己的线程里跑, PeekMessage + Dispatch"""
+        cls._running = True
         msg = wintypes.MSG()
-        while ctypes.windll.user32.GetMessageW(ctypes.byref(msg), cls._hwnd, 0, 0):
-            if msg.message == WM_HOTKEY:
-                cb = cls._callbacks.get(msg.wParam)
-                if cb:
-                    threading.Thread(target=cb, daemon=True).start()
-            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+        while cls._running:
+            if ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None,
+                                                  0, 0, 1):  # PM_REMOVE=1
+                if msg.message == WM_HOTKEY:
+                    cb = cls._callbacks.get(msg.wParam)
+                    if cb:
+                        threading.Thread(target=cb, daemon=True).start()
+                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+            else:
+                time.sleep(0.05)
 
     @classmethod
     def stop(cls):
-        if cls._hwnd:
-            ctypes.windll.user32.PostMessageW(cls._hwnd, 0x0010, 0, 0)  # WM_CLOSE
-
-    @classmethod
-    def _wnd_proc(cls, hwnd, msg, wparam, lparam):
-        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-    @staticmethod
-    def _create_window():
-        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p,
-                                      ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_longlong)
-        proc = WNDPROC(GlobalHotkey._wnd_proc)
-
-        wc = wintypes.WNDCLASSW()
-        wc.lpfnWndProc = proc
-        wc.lpszClassName = 'AutoReplyHotkeyWindow'
-        wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
-        atom = ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
-
-        hwnd = ctypes.windll.user32.CreateWindowExW(
-            0, ctypes.cast(atom, wintypes.LPCWSTR), '', 0,
-            0, 0, 0, 0, 0, 0, wc.hInstance, None)
-        GlobalHotkey._hwnd = hwnd
-        return hwnd
+        cls._running = False
 
 
 # ==================== COM / 底层工具 ====================
@@ -146,28 +123,51 @@ def get_hwnd():
 
 class FreshNav:
     @staticmethod
-    def _win():
-        h = get_hwnd()
-        if not h: return None
-        init_com()
-        try: return uia.ControlFromHandle(h)
-        except:
-            try: return uia.WindowControl(ClassName='mmui::MainWindow', searchDepth=1)
-            except: return None
+    @staticmethod
+    def _try_uia(max_retries=2):
+        """重试获取UIA窗口, 处理stale引用"""
+        for i in range(max_retries):
+            try:
+                h = get_hwnd()
+                if not h: return None
+                init_com()
+                # 每次重新从HWND创建, 避免缓存
+                return uia.ControlFromHandle(h)
+            except:
+                if i == max_retries - 1: return None
+                time.sleep(0.3)
+        return None
 
     @staticmethod
     def _nav_splitter():
-        w = FreshNav._win()
+        w = FreshNav._try_uia()
         if not w: return None
-        r = w.GroupControl(searchDepth=1)
-        s = r.CustomControl(ClassName='QStackedWidget')
-        m = s.GroupControl(ClassName='mmui::MainView')
-        cw = [c for c in m.GetChildren() if c.ClassName=='QWidget' and c.ControlTypeName=='GroupControl']
-        if not cw: return None
-        im = cw[0].GroupControl(ClassName='mmui::MainView')
-        sp = im.CustomControl(ClassName='mmui::XSplitterView')
-        os = sp.CustomControl(ClassName='mmui::XStackedWidget')
-        return os.CustomControl(ClassName='mmui::XSplitterView')
+        try:
+            r = w.GroupControl(searchDepth=1)
+            s = r.CustomControl(ClassName='QStackedWidget')
+            m = s.GroupControl(ClassName='mmui::MainView')
+            cw = [c for c in m.GetChildren() if c.ClassName=='QWidget' and c.ControlTypeName=='GroupControl']
+            if not cw: return None
+            im = cw[0].GroupControl(ClassName='mmui::MainView')
+            sp = im.CustomControl(ClassName='mmui::XSplitterView')
+            os = sp.CustomControl(ClassName='mmui::XStackedWidget')
+            return os.CustomControl(ClassName='mmui::XSplitterView')
+        except LookupError:
+            # stale, 重试一次
+            w = FreshNav._try_uia()
+            if not w: return None
+            try:
+                r = w.GroupControl(searchDepth=1)
+                s = r.CustomControl(ClassName='QStackedWidget')
+                m = s.GroupControl(ClassName='mmui::MainView')
+                cw = [c for c in m.GetChildren() if c.ClassName=='QWidget' and c.ControlTypeName=='GroupControl']
+                if not cw: return None
+                im = cw[0].GroupControl(ClassName='mmui::MainView')
+                sp = im.CustomControl(ClassName='mmui::XSplitterView')
+                os = sp.CustomControl(ClassName='mmui::XStackedWidget')
+                return os.CustomControl(ClassName='mmui::XSplitterView')
+            except: return None
+        except: return None
 
     @staticmethod
     def get_message_items():
@@ -442,6 +442,13 @@ class MonitorEngine:
 
     def _open_chat(self, who):
         """打开指定会话: 可见列表→翻页→搜索框"""
+        try:
+            return self.__open_chat(who)
+        except (LookupError, Exception) as e:
+            self.log('[ERR] _open_chat失败: {}'.format(str(e)[:50]))
+            return False
+
+    def __open_chat(self, who):
         init_com()
         uia.SetGlobalSearchTimeout(2)
 
@@ -686,7 +693,6 @@ class MonitorEngine:
 
         # 控制台 Ctrl+C 信号处理
         try:
-            import signal
             signal.signal(signal.SIGINT, lambda sig, frame: self.stop())
         except: pass
 
@@ -759,10 +765,14 @@ class MonitorEngine:
                     time.sleep(0.3)
                     continue
 
-                self.status['round'] += 1
-                self.status['total_rounds'] = '-'
-                self._poll_all_rules(rules, is_once=False)
-                time.sleep(max(self.poll_interval, 0.1))  # 最少100ms防止空转
+                try:
+                    self.status['round'] += 1
+                    self.status['total_rounds'] = '-'
+                    self._poll_all_rules(rules, is_once=False)
+                    time.sleep(max(self.poll_interval, 0.1))
+                except (LookupError, Exception) as e:
+                    self.log('[ERR] 本轮异常: {}'.format(str(e)[:60]))
+                    time.sleep(1)
 
             # ==== 暂停阶段 ====
             if pause_dur > 0 and not self.stop_requested:
@@ -1462,7 +1472,6 @@ class AutoReplyUI:
             self.engine.log('[CTRL+C] 强制中断')
             self.engine.stop()
         try:
-            import signal
             signal.signal(signal.SIGINT, _sigint)
         except: pass
         def log_printer():
