@@ -423,13 +423,11 @@ class MonitorEngine:
     # ---- 核心操作 ----
 
     def _open_chat(self, who):
-        """打开指定会话: 可见列表→慢速翻页→搜索框"""
+        """打开指定会话: 可见列表→翻页→搜索框"""
         init_com()
-        focus_wechat()
-        time.sleep(0.05)
         uia.SetGlobalSearchTimeout(2)
 
-        # 快速路径: 当前已是目标聊天
+        # 快速路径: 当前已是目标聊天(不切窗口)
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
@@ -437,7 +435,11 @@ class MonitorEngine:
                 return True
         except: pass
 
-        # ---- 方法1: 可见列表 + 慢速翻页扫描 ----
+        # 需要切换聊天 → 切前台
+        focus_wechat()
+        time.sleep(0.05)
+
+        # ---- 方法1: 可见列表 + 翻页 ----
         table = FreshNav.get_session_table()
         if not table:
             return False
@@ -659,8 +661,6 @@ class MonitorEngine:
             self.mode = 'once'
 
     def _runner(self):
-        focus_wechat()
-        time.sleep(0.15)
         init_com()
         uia.SetGlobalSearchTimeout(3)
         self._validate_mode()
@@ -740,9 +740,7 @@ class MonitorEngine:
                 continue
             time.sleep(0.1)
 
-            # 2. 取最新一条 incoming (先确保微信前台)
-            focus_wechat()
-            time.sleep(0.05)
+            # 2. 取最新一条 incoming (后台检测, 不切窗口)
             cur_name, items = FreshNav.get_message_items()
             if not cur_name or cur_name.strip() != chat.strip():
                 self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
