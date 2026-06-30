@@ -638,32 +638,43 @@ class MonitorEngine:
                 self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
                 continue
 
+            # 取最后一条文本消息(包含自己发的, 用于刷新去重)
             latest = None
             for item in reversed(list(items)):
                 msg = RawMsg(item)
                 if msg.is_timestamp or not msg.name.strip():
                     continue
-                if self._is_self(msg.name):
-                    continue
                 latest = msg
                 break
 
             if latest is None:
-                self.log('[POLL] 聊天: {} 无 incoming'.format(chat))
+                self.log('[POLL] 聊天: {} 无消息'.format(chat))
                 continue
+
+            is_self = self._is_self(latest.name)
+            if is_self:
+                self.log('[POLL] 聊天: {} 最后消息: {!r} (自己)'.format(chat, latest.name[:50]))
+            else:
+                self.log('[POLL] 聊天: {} 最后消息: {!r}'.format(chat, latest.name[:60]))
 
             # 3. 和上次相同→跳过
             prev = self.last_incoming.get(chat, '')
-            if latest.name.strip() == prev:
+            cur_text = latest.name.strip()
+            if cur_text == prev:
                 self.log('[DEDUP] 最后消息未变 {!r} -> SKIP'.format(prev[:30]))
                 continue
-            self.last_incoming[chat] = latest.name.strip()
 
-            self.log('[POLL] 聊天: {} 最后消息: {!r}'.format(chat, latest.name[:60]))
+            # 更新基准(自己发的也更新, 下次只检测新消息)
+            self.last_incoming[chat] = cur_text
+
             self.status['current_chat'] = chat
-            self.status['last_message'] = latest.name[:60]
+            self.status['last_message'] = cur_text[:60]
 
-            # 4. 逐条规则匹配, 命中第一条即回复并停止
+            # 4. 自己发的不触发规则, 但已刷新去重
+            if is_self:
+                continue
+
+            # 5. 逐条规则匹配, 命中第一条即回复并停止
             for idx, rule in rule_list:
                 if not self._match_kw(latest.name, rule.keyword):
                     continue
