@@ -475,70 +475,59 @@ class MonitorEngine:
     def __open_chat(self, who):
         init_com()
         uia.SetGlobalSearchTimeout(2)
-        if self.status.get('current_chat', '') == who:
-            return True
-        focus_wechat()
-        time.sleep(0.05)
+        if self.status.get('current_chat','') == who: return True
+        focus_wechat(); time.sleep(0.05)
 
-        def _all_cells():
+        def _cells():
             win = FreshNav._try_uia()
             if not win: return []
             r = []
             def rec(ele):
                 try:
-                    if (ele.ControlTypeName == 'ListItemControl' and
-                        ele.ClassName and 'ChatSessionCell' in ele.ClassName):
+                    if ele.ControlTypeName=='ListItemControl' and ele.ClassName and 'ChatSessionCell' in ele.ClassName:
                         r.append(ele)
                 except: pass
                 try:
-                    for cc in ele.GetChildren():
-                        rec(cc)
+                    for cc in ele.GetChildren(): rec(cc)
                 except: pass
-            rec(win)
-            return r
+            rec(win); return r
 
-        def _click_cell(cells, who):
+        def _click(cells,who):
             for c in cells:
                 try:
-                    n = c.Name.split(chr(10))[0]
-                    if n.strip() == who:
-                        r = c.BoundingRectangle
-                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.25)
-                        self.status['current_chat'] = who
-                        return True
+                    if c.Name.split(chr(10))[0].strip()==who:
+                        mouse_click((c.BoundingRectangle.left+c.BoundingRectangle.right)//2,
+                                    (c.BoundingRectangle.top+c.BoundingRectangle.bottom)//2)
+                        time.sleep(0.3); self.status['current_chat']=who; return True
                 except: pass
             return False
 
-        cells = _all_cells()
-        if _click_cell(cells, who):
-            return True
+        # Check current cells
+        cells=_cells()
+        if _click(cells,who): return True
 
-        # Click first cell to focus the list, then use PgDn/PgUp
-        import ctypes
-        VK_NEXT = 0x22  # PgDn
-        VK_PRIOR = 0x21  # PgUp
-
-        if cells:
-            r0 = cells[0].BoundingRectangle
-            mouse_click((r0.left+r0.right)//2, (r0.top+r0.bottom)//2)
+        # Walk through list: open any cell -> go back -> new cells appear
+        # Toggle between chat and chat-list cycles through session positions
+        for _walk in range(20):
+            if not cells: break
+            # Click the LAST cell (furthest down) to shift viewport down
+            last = cells[-1]
+            r = last.BoundingRectangle
+            mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
             time.sleep(0.15)
-
-        for step in range(30):
-            if step < 20:
-                # scroll down with PgDn
-                ctypes.windll.user32.keybd_event(VK_NEXT, 0, 0, 0)
-                time.sleep(0.03)
-                ctypes.windll.user32.keybd_event(VK_NEXT, 0, 2, 0)
-            else:
-                # scroll up with PgUp
-                ctypes.windll.user32.keybd_event(VK_PRIOR, 0, 0, 0)
-                time.sleep(0.03)
-                ctypes.windll.user32.keybd_event(VK_PRIOR, 0, 2, 0)
-            time.sleep(0.25)
-            cells = _all_cells()
-            if _click_cell(cells, who):
-                return True
+            # Click back to chat list tab
+            try:
+                win = FreshNav._try_uia()
+                if win:
+                    root = win.GroupControl(searchDepth=1)
+                    stacked = root.CustomControl(ClassName='QStackedWidget')
+                    mv = stacked.GroupControl(ClassName='mmui::MainView')
+                    nav = mv.ToolBarControl(ClassName='mmui::MainTabBar')
+                    nav.GetChildren()[0].Click(simulateMove=False)
+                    time.sleep(0.2)
+            except: pass
+            cells = _cells()
+            if _click(cells, who): return True
 
         return False
 
