@@ -502,13 +502,24 @@ class MonitorEngine:
 
     def __open_chat(self, who):
         init_com()
+
+        # 1. 快速路径: 当前已在目标聊天 → 直接读消息, 不切不搜
+        try:
+            cur_name, _ = FreshNav.get_message_items()
+            if cur_name and cur_name.strip() == who.strip():
+                self.status["current_chat"] = who
+                self.pinned_chats.add(who)
+                return True
+        except: pass
+
+        # 2. 需要切换 → 切前台
         focus_wechat(); time.sleep(0.05)
 
-        # 已打开过的聊天 → 直接点单元格 (已浮动到顶部可见区)
+        # 3. 已浮到顶部的聊天 → 直接点击可见单元格
         if who in self.pinned_chats and self._click_visible_cell(who):
             return True
 
-        # 首次打开 → Ctrl+F 搜索 (打开后自动浮到顶部)
+        # 4. 首次打开 → Ctrl+F 搜索 (打开后浮到顶部)
         uia.SendKeys("{Ctrl}f", waitTime=0.1)
         time.sleep(0.2)
         pyperclip.copy(who)
@@ -725,14 +736,24 @@ class MonitorEngine:
         for idx, rule in enumerate(rules):
             grouped.setdefault(rule.chat, []).append((idx, rule))
 
+        single_chat = (len(grouped) == 1)  # 只有一个聊天对象时优化
+
         for chat, rule_list in grouped.items():
             if self.stop_requested: break
 
-            # 1. 打开聊天
-            if not self._open_chat(chat):
-                self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
-                continue
-            time.sleep(0.1)
+            # 1. 打开聊天 (单聊天时只在首轮打开, 后续轮直接读)
+            should_skip = False
+            if single_chat and chat in self.pinned_chats:
+                try:
+                    cur, _ = FreshNav.get_message_items()
+                    if cur and cur.strip() == chat.strip():
+                        should_skip = True
+                except: pass
+            if not should_skip:
+                if not self._open_chat(chat):
+                    self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
+                    continue
+                time.sleep(0.1)
 
             # 2. 取最后一条 incoming 消息
             cur_name, items = FreshNav.get_message_items()
