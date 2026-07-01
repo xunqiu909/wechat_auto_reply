@@ -333,7 +333,8 @@ class MonitorEngine:
         self.log_queue = queue.Queue()
 
         self.baseline_ids = {}
-        self.pinned_chats = set()   # 已打开过的聊天(已浮到顶部),下次不用搜
+        self.last_incoming = {}   # {chat: text} 上次已回复的消息
+        self.pinned_chats = set()   # 已浮到顶部的聊天, 下次不用搜
         self.sent_texts = set()   # 自己发过的文本(防循环)
         self.stop_requested = False  # 用于 Ctrl+C / 超时 / 手动停止
 
