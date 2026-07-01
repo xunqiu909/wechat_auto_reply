@@ -695,13 +695,21 @@ class MonitorEngine:
         self.log('[END] 运行结束，耗时 {} 秒，共 {} 轮'.format(elapsed, self.status['round']))
 
     def _poll_once(self):
+        """循环检测直到匹配并回复一次, 然后停止"""
         rules = [r for r in self.rules if r.enabled]
         if not rules:
             self.log('[SKIP] 没有启用的规则')
             return
-        self.status['round'] = 1
+        self.log('[ONCE] 等待匹配消息, 检测到后回复一次并停止')
         self.status['total_rounds'] = 1
-        self._poll_all_rules(rules, is_once=True)
+        while not self.stop_requested:
+            self.status['round'] += 1
+            self._poll_all_rules(rules, is_once=True)
+            # 检查是否已触发回复
+            if self.status.get('last_send') == '成功':
+                self.log('[ONCE] 已回复, 停止检测')
+                break
+            time.sleep(self.poll_interval)
 
     def _loop_forever(self, start_time):
         """循环检测: 激活N秒 → 暂停N秒 → 重复，直到手动停止"""
@@ -908,8 +916,8 @@ class AutoReplyUI:
 
         self.root = tk.Tk()
         self.root.title('wxauto 自动回复监控')
-        self.root.geometry('1440x920')
-        self.root.minsize(900, 650)
+        self.root.geometry('1000x750')
+        self.root.minsize(850, 600)
         self.root.configure(bg=self.C['bg'])
 
         self._build_ui()
