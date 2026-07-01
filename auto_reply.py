@@ -681,11 +681,11 @@ class MonitorEngine:
         self.log('[END] 运行结束，耗时 {} 秒，共 {} 轮'.format(elapsed, self.status['round']))
 
     def _poll_once(self):
-        """单次检测: 遍历所有规则一次，匹配则回复，然后停止"""
         rules = [r for r in self.rules if r.enabled]
         if not rules:
             self.log('[SKIP] 没有启用的规则')
             return
+        self.status['round'] = 1
         self.status['total_rounds'] = 1
         self._poll_all_rules(rules, is_once=True)
 
@@ -741,11 +741,15 @@ class MonitorEngine:
         for chat, rule_list in grouped.items():
             if self.stop_requested: break
 
-            # 1. 确保在目标聊天 (单聊天且已打开: 静默跳过, 不切不点击)
-            if single and chat in self.pinned_chats:
-                if not self._on_target(chat):
-                    self.pinned_chats.discard(chat)  # 走丢了,重开
-            if not (single and chat in self.pinned_chats):
+            # 1. 确保在目标聊天
+            need_open = True
+            if not is_once and single and chat in self.pinned_chats:
+                # 循环+单聊天+已打开: 静默读, 不切屏
+                if self._on_target(chat):
+                    need_open = False
+                else:
+                    self.pinned_chats.discard(chat)
+            if need_open:
                 if not self._open_chat(chat):
                     self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                     continue
