@@ -498,7 +498,21 @@ class MonitorEngine:
                     if c.Name.split(chr(10))[0].strip()==who:
                         mouse_click((c.BoundingRectangle.left+c.BoundingRectangle.right)//2,
                                     (c.BoundingRectangle.top+c.BoundingRectangle.bottom)//2)
-                        time.sleep(0.3); self.status['current_chat']=who; return True
+                        time.sleep(0.4)  # wait for chat to open
+                        # verify: check if chat opened
+                        cur, items = FreshNav.get_message_items()
+                        if cur and cur.strip() == who:
+                            self.status['current_chat'] = who
+                            return True
+                        # retry click if failed
+                        time.sleep(0.3)
+                        mouse_click((c.BoundingRectangle.left+c.BoundingRectangle.right)//2,
+                                    (c.BoundingRectangle.top+c.BoundingRectangle.bottom)//2)
+                        time.sleep(0.4)
+                        cur, _ = FreshNav.get_message_items()
+                        if cur and cur.strip() == who:
+                            self.status['current_chat'] = who
+                            return True
                 except: pass
             return False
 
@@ -745,10 +759,14 @@ class MonitorEngine:
                 continue
             time.sleep(0.1)
 
-            # 2. 取最新一条 incoming (后台检测, 不切窗口)
-            cur_name, items = FreshNav.get_message_items()
+            # 2. 取消息 (重试最多2秒)
+            cur_name = None; items = []
+            for retry in range(10):
+                cur_name, items = FreshNav.get_message_items()
+                if cur_name and items: break
+                time.sleep(0.2)
             if not cur_name or cur_name.strip() != chat.strip():
-                self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
+                self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}] msg={}'.format(chat, cur_name, len(items)))
                 continue
 
             # 取最后一条文本消息(包含自己发的, 用于刷新去重)
