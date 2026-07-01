@@ -650,7 +650,8 @@ class MonitorEngine:
                 threading.Thread(target=GlobalHotkey.pump, daemon=True).start()
                 self.log('[HOTKEY] Ctrl+Shift+C 全局强制停止已注册')
             except Exception as e:
-                self.log('[HOTKEY] 注册失败: {}'.format(e))
+                if '1409' not in str(e):  # 1409=已注册, 忽略
+                    self.log('[HOTKEY] 注册失败: {}'.format(e))
 
         # 控制台 Ctrl+C 信号处理
         try:
