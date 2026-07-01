@@ -26,18 +26,44 @@ VK_F12   = 0x7B
 WM_HOTKEY = 0x0312
 
 class GlobalHotkey:
-    """Win32 全局热键 — 用 ctypes 直接调 API"""
+    """Win32 全局热键 — 创建隐藏窗口, 在主线程消息循环中处理"""
+
+    _hwnd = None
     _callbacks = {}
     _next_id = 0
-    _running = False
+
+    @classmethod
+    def _ensure_window(cls):
+        if cls._hwnd: return
+        # 注册窗口类
+        wc_name = 'WxAutoHotkeyWnd'
+        wndproc = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_void_p,
+                                      ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_longlong)
+        def _proc(hwnd, msg, wparam, lparam):
+            if msg == WM_HOTKEY:
+                cb = cls._callbacks.get(wparam)
+                if cb:
+                    threading.Thread(target=cb, daemon=True).start()
+                return 0
+            return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        cls._wndproc = wndproc(_proc)
+
+        wc = wintypes.WNDCLASSW()
+        wc.lpfnWndProc = cls._wndproc
+        wc.lpszClassName = wc_name
+        wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
+
+        cls._hwnd = ctypes.windll.user32.CreateWindowExW(
+            0, wc_name, '', 0, 0, 0, 0, 0, None, None, wc.hInstance, None)
 
     @classmethod
     def register(cls, modifiers, vk, callback):
+        cls._ensure_window()
         cls._next_id += 1
         hkid = cls._next_id
         cls._callbacks[hkid] = callback
-
-        ok = ctypes.windll.user32.RegisterHotKey(None, hkid, modifiers, vk)
+        ok = ctypes.windll.user32.RegisterHotKey(cls._hwnd, hkid, modifiers, vk)
         if not ok:
             raise RuntimeError('RegisterHotKey failed (err={})'.format(
                 ctypes.windll.kernel32.GetLastError()))
@@ -45,29 +71,18 @@ class GlobalHotkey:
 
     @classmethod
     def unregister(cls, hkid):
-        ctypes.windll.user32.UnregisterHotKey(None, hkid)
+        if cls._hwnd:
+            ctypes.windll.user32.UnregisterHotKey(cls._hwnd, hkid)
         cls._callbacks.pop(hkid, None)
 
     @classmethod
-    def pump(cls):
-        """在自己的线程里跑, PeekMessage + Dispatch"""
-        cls._running = True
+    def pump_once(cls):
+        """在主线程调用一次, 处理消息队列中的WM_HOTKEY"""
+        if not cls._hwnd: return
         msg = wintypes.MSG()
-        while cls._running:
-            if ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), None,
-                                                  0, 0, 1):  # PM_REMOVE=1
-                if msg.message == WM_HOTKEY:
-                    cb = cls._callbacks.get(msg.wParam)
-                    if cb:
-                        threading.Thread(target=cb, daemon=True).start()
-                ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
-                ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
-            else:
-                time.sleep(0.05)
-
-    @classmethod
-    def stop(cls):
-        cls._running = False
+        while ctypes.windll.user32.PeekMessageW(ctypes.byref(msg), cls._hwnd, 0, 0, 1):
+            ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+            ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
 
 
 # ==================== COM / 底层工具 ====================
@@ -643,17 +658,17 @@ class MonitorEngine:
         self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
 
-        # 注册全局热键 Ctrl+Shift+C 强制停止(控制台Ctrl+C也有效)
+        # 注册全局热键 Ctrl+Shift+C 强制停止(只注册一次)
         if not hasattr(MonitorEngine, '_hotkey_hkid'):
             try:
                 _stop_self = self.stop
                 MonitorEngine._hotkey_hkid = GlobalHotkey.register(
                     MOD_CONTROL | MOD_SHIFT, 0x43,  # VK_C
                     lambda: _stop_self())
-                threading.Thread(target=GlobalHotkey.pump, daemon=True).start()
                 self.log('[HOTKEY] Ctrl+Shift+C 全局强制停止已注册')
             except Exception as e:
-                if '1409' not in str(e):  # 1409=已注册, 忽略
+                MonitorEngine._hotkey_hkid = None
+                if '1409' not in str(e) and '1410' not in str(e):
                     self.log('[HOTKEY] 注册失败: {}'.format(e))
 
         # 控制台 Ctrl+C 信号处理
@@ -922,8 +937,8 @@ class AutoReplyUI:
 
         self.root = tk.Tk()
         self.root.title('wxauto 自动回复监控')
-        self.root.geometry('1000x750')
-        self.root.minsize(850, 600)
+        self.root.geometry('1400x1000')
+        self.root.minsize(900, 650)
         self.root.configure(bg=self.C['bg'])
 
         self._build_ui()
@@ -1351,6 +1366,8 @@ class AutoReplyUI:
         else: self.round_label.config(text='')
         if not running: self._set_ui_stopped()
         self._update_hint()
+        try: GlobalHotkey.pump_once()  # 主线程处理全局热键
+        except: pass
         self.root.after(1000, self._update_status)
 
     def _update_hint(self):
@@ -1370,6 +1387,8 @@ class AutoReplyUI:
         try:
             while True: self._append_log(self.engine.log_queue.get_nowait())
         except queue.Empty: pass
+        try: GlobalHotkey.pump_once()  # 高频检查热键(300ms)
+        except: pass
         self.root.after(300, self._pull_logs)
 
     def _console_mode(self):
