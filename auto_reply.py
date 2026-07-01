@@ -548,9 +548,12 @@ class MonitorEngine:
         self.log('[FAIL] 3次重试均无法打开: {}'.format(who[:20]))
         return False
     def _send_reply(self, text):
-        # 抢焦点到微信
-        focus_wechat()
-        time.sleep(0.2)  # 等窗口真正拿到焦点
+        # 抢焦点到微信 (后台线程可能无法SetForegroundWindow, 用try保护)
+        try:
+            focus_wechat()
+            time.sleep(0.15)
+        except Exception:
+            pass  # 即使抢不到焦点, 也尝试发送
         init_com()
 
         # 获取输入框坐标点击
@@ -705,11 +708,13 @@ class MonitorEngine:
         self.status['total_rounds'] = 1
         while not self.stop_requested:
             self.status['round'] += 1
-            self._poll_all_rules(rules, is_once=True)
-            # 检查是否已触发回复
-            if self.status.get('last_send') == '成功':
-                self.log('[ONCE] 已回复, 停止检测')
-                break
+            try:
+                self._poll_all_rules(rules, is_once=True)
+                if self.status.get('last_send') == '成功':
+                    self.log('[ONCE] 已回复, 停止检测')
+                    break
+            except Exception as e:
+                self.log('[ERR] 本轮异常: {}'.format(str(e)[:60]))
             time.sleep(self.poll_interval)
 
     def _loop_forever(self, start_time):
