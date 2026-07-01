@@ -508,10 +508,10 @@ class MonitorEngine:
         return False
 
     def __open_chat(self, who):
-        """智能打开聊天: 已在目标→不切; 已浮顶→点单元格; 首次→Ctrl+F"""
+        """打开聊天: 已在目标→不切; 首次→Ctrl+F; 多聊天时此方法每轮调用"""
         init_com()
 
-        # 已在目标聊天 → 直接返回(不切屏不操作)
+        # 已在目标 → 不操作
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
@@ -520,14 +520,9 @@ class MonitorEngine:
                 return True
         except: pass
 
-        # 需要切换 → 切前台
         focus_wechat(); time.sleep(0.05)
 
-        # 已浮到顶部的聊天 → 直接点击可见单元格
-        if who in self.pinned_chats and self._click_visible_cell(who):
-            return True
-
-        # 首次打开 → Ctrl+F 搜索
+        # Ctrl+F 搜索 + Enter 打开
         uia.SendKeys("{Ctrl}f", waitTime=0.1)
         time.sleep(0.2)
         pyperclip.copy(who)
@@ -736,7 +731,7 @@ class MonitorEngine:
                     slept += 1
 
     def _poll_all_rules(self, rules, is_once):
-        """按聊天分组检测。单聊天: 首轮打开后静默读; 多聊天: 每轮切换"""
+        """按聊天分组检测。单聊天: 首轮后静默读; 多聊天: 每轮切换"""
         grouped = {}
         for idx, rule in enumerate(rules):
             grouped.setdefault(rule.chat, []).append((idx, rule))
@@ -746,13 +741,17 @@ class MonitorEngine:
         for chat, rule_list in grouped.items():
             if self.stop_requested: break
 
-            # 打开聊天 (单聊天+已在上方: 直接读消息, 不切屏)
-            if single_chat and chat in self.pinned_chats:
-                if not self._on_target(chat):
+            # 打开聊天
+            if single_chat:
+                # 单聊天: 首轮Ctrl+F打开一次, 后续全静默读(不点不切)
+                if chat not in self.pinned_chats:
                     if not self._open_chat(chat):
                         self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                         continue
+                    time.sleep(0.1)
+                # 已 pinned → 直接读消息, 不调用_open_chat
             else:
+                # 多聊天: 每轮切换
                 if not self._open_chat(chat):
                     self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                     continue
