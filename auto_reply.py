@@ -474,77 +474,19 @@ class MonitorEngine:
 
     def __open_chat(self, who):
         init_com()
-        uia.SetGlobalSearchTimeout(2)
-        if self.status.get('current_chat','') == who: return True
-        focus_wechat(); time.sleep(0.05)
-
-        def _cells():
-            win = FreshNav._try_uia()
-            if not win: return []
-            r = []
-            def rec(ele):
-                try:
-                    if ele.ControlTypeName=='ListItemControl' and ele.ClassName and 'ChatSessionCell' in ele.ClassName:
-                        r.append(ele)
-                except: pass
-                try:
-                    for cc in ele.GetChildren(): rec(cc)
-                except: pass
-            rec(win); return r
-
-        def _click(cells,who):
-            for c in cells:
-                try:
-                    if c.Name.split(chr(10))[0].strip()==who:
-                        mouse_click((c.BoundingRectangle.left+c.BoundingRectangle.right)//2,
-                                    (c.BoundingRectangle.top+c.BoundingRectangle.bottom)//2)
-                        time.sleep(0.4)  # wait for chat to open
-                        # verify: check if chat opened
-                        cur, items = FreshNav.get_message_items()
-                        if cur and cur.strip() == who:
-                            self.status['current_chat'] = who
-                            return True
-                        # retry click if failed
-                        time.sleep(0.3)
-                        mouse_click((c.BoundingRectangle.left+c.BoundingRectangle.right)//2,
-                                    (c.BoundingRectangle.top+c.BoundingRectangle.bottom)//2)
-                        time.sleep(0.4)
-                        cur, _ = FreshNav.get_message_items()
-                        if cur and cur.strip() == who:
-                            self.status['current_chat'] = who
-                            return True
-                except: pass
-            return False
-
-        # Check current cells
-        cells=_cells()
-        if _click(cells,who): return True
-
-        # Walk through list: open any cell -> go back -> new cells appear
-        # Toggle between chat and chat-list cycles through session positions
-        for _walk in range(20):
-            if not cells: break
-            # Click the LAST cell (furthest down) to shift viewport down
-            last = cells[-1]
-            r = last.BoundingRectangle
-            mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-            time.sleep(0.15)
-            # Click back to chat list tab
-            try:
-                win = FreshNav._try_uia()
-                if win:
-                    root = win.GroupControl(searchDepth=1)
-                    stacked = root.CustomControl(ClassName='QStackedWidget')
-                    mv = stacked.GroupControl(ClassName='mmui::MainView')
-                    nav = mv.ToolBarControl(ClassName='mmui::MainTabBar')
-                    nav.GetChildren()[0].Click(simulateMove=False)
-                    time.sleep(0.2)
-            except: pass
-            cells = _cells()
-            if _click(cells, who): return True
-
-        return False
-
+        if self.status.get("current_chat","") == who: return True
+        focus_wechat()
+        time.sleep(0.1)
+        # Ctrl+F to focus search bar -> paste -> Enter to open
+        uia.SendKeys("{Ctrl}f", waitTime=0.1)
+        time.sleep(0.35)
+        pyperclip.copy(who)
+        uia.SendKeys("{Ctrl}v", waitTime=0.05)
+        time.sleep(0.4)
+        uia.SendKeys("{Enter}", waitTime=0.05)
+        time.sleep(0.8)
+        self.status["current_chat"] = who
+        return True
     def _send_reply(self, text):
         # 抢焦点到微信
         focus_wechat()
