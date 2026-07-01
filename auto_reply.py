@@ -731,27 +731,21 @@ class MonitorEngine:
                     slept += 1
 
     def _poll_all_rules(self, rules, is_once):
-        """按聊天分组检测。单聊天: 首轮后静默读; 多聊天: 每轮切换"""
+        """按聊天分组检测"""
         grouped = {}
         for idx, rule in enumerate(rules):
             grouped.setdefault(rule.chat, []).append((idx, rule))
 
-        single_chat = (len(grouped) == 1)
+        single = (len(grouped) == 1)
 
         for chat, rule_list in grouped.items():
             if self.stop_requested: break
 
-            # 打开聊天
-            if single_chat:
-                # 单聊天: 首轮Ctrl+F打开一次, 后续全静默读(不点不切)
-                if chat not in self.pinned_chats:
-                    if not self._open_chat(chat):
-                        self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
-                        continue
-                    time.sleep(0.1)
-                # 已 pinned → 直接读消息, 不调用_open_chat
-            else:
-                # 多聊天: 每轮切换
+            # 1. 确保在目标聊天 (单聊天且已打开: 静默跳过, 不切不点击)
+            if single and chat in self.pinned_chats:
+                if not self._on_target(chat):
+                    self.pinned_chats.discard(chat)  # 走丢了,重开
+            if not (single and chat in self.pinned_chats):
                 if not self._open_chat(chat):
                     self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                     continue
