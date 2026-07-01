@@ -122,16 +122,17 @@ def get_hwnd():
 # ==================== UIA 导航 ====================
 
 class FreshNav:
+    """每次从 HWND 全新建立 UIA 树, 杜绝stale引用"""
+
     @staticmethod
-    @staticmethod
-    def _try_uia(max_retries=2):
-        """重试获取UIA窗口, 处理stale引用"""
+    def _try_uia(max_retries=3):
         for i in range(max_retries):
             try:
                 h = get_hwnd()
+                if not h:
+                    h = win32gui.FindWindow('mmui::MainWindow', None)
                 if not h: return None
                 init_com()
-                # 每次重新从HWND创建, 避免缓存
                 return uia.ControlFromHandle(h)
             except:
                 if i == max_retries - 1: return None
@@ -139,7 +140,8 @@ class FreshNav:
         return None
 
     @staticmethod
-    def _nav_splitter():
+    def _nav_outer_splitter():
+        """导航到外层 XSplitterView (含左侧会话列表+右侧聊天面板)"""
         w = FreshNav._try_uia()
         if not w: return None
         try:
@@ -152,32 +154,51 @@ class FreshNav:
             sp = im.CustomControl(ClassName='mmui::XSplitterView')
             os = sp.CustomControl(ClassName='mmui::XStackedWidget')
             return os.CustomControl(ClassName='mmui::XSplitterView')
-        except LookupError:
-            # stale, 重试一次
-            w = FreshNav._try_uia()
-            if not w: return None
-            try:
-                r = w.GroupControl(searchDepth=1)
-                s = r.CustomControl(ClassName='QStackedWidget')
-                m = s.GroupControl(ClassName='mmui::MainView')
-                cw = [c for c in m.GetChildren() if c.ClassName=='QWidget' and c.ControlTypeName=='GroupControl']
-                if not cw: return None
-                im = cw[0].GroupControl(ClassName='mmui::MainView')
-                sp = im.CustomControl(ClassName='mmui::XSplitterView')
-                os = sp.CustomControl(ClassName='mmui::XStackedWidget')
-                return os.CustomControl(ClassName='mmui::XSplitterView')
-            except: return None
         except: return None
 
     @staticmethod
+    def _nav_right_panel():
+        """导航到右侧聊天面板 XStackedWidget"""
+        outer = FreshNav._nav_outer_splitter()
+        if not outer: return None
+        try:
+            children = outer.GetChildren()
+            rights = [c for c in children if c.ClassName == 'mmui::XStackedWidget']
+            return rights[0] if rights else None
+        except: return None
+
+    @staticmethod
+    def _get_chat_page(st):
+        """从右侧 XStackedWidget 获取 ChatMessagePage (兼容4.1.8和4.1.10)"""
+        if not st: return None
+        # 先快速路径: 直接子控件 (4.1.10+, 无 ChatDetailView 包裹)
+        try:
+            children = st.GetChildren()
+            if children:
+                for c in children:
+                    if c.ClassName == 'mmui::ChatMessagePage':
+                        return c
+        except: pass
+        # 4.1.8: ChatDetailView 包裹 (带短超时避免卡死)
+        try:
+            uia.SetGlobalSearchTimeout(0.5)
+            cd = st.GroupControl(ClassName='mmui::ChatDetailView')
+            cp = cd.GetFirstChildControl()
+            if cp and cp.ClassName == 'mmui::ChatMessagePage':
+                return cp
+        except: pass
+        finally:
+            uia.SetGlobalSearchTimeout(5)
+        return None
+
+    @staticmethod
     def get_message_items():
-        sp = FreshNav._nav_splitter()
-        if not sp: return None, []
-        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
-        if not rights: return None, []
-        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
-        cp = cd.GetFirstChildControl()
-        if cp.ClassName != 'mmui::ChatMessagePage': return None, []
+        """获取当前聊天消息。返回 (chat_name, [items])"""
+        st = FreshNav._nav_right_panel()
+        if not st: return None, []
+        cp = FreshNav._get_chat_page(st)
+        if cp is None: return None, []
+        # 聊天名
         tb = cp.GetChildren()[0]
         def find_name(ele):
             try:
@@ -185,11 +206,12 @@ class FreshNav:
                     n = ele.Name or ''
                     if n and not (n.startswith('(') and n.endswith(')')): return n
                 for c in ele.GetChildren():
-                    r = find_name(c)
+                    r = find_name(c); 
                     if r: return r
             except: pass
             return None
         chat_name = find_name(tb)
+        # 消息列表
         split = cp.CustomControl(ClassName='mmui::XSplitterView')
         mvs = [c for c in split.GetChildren() if c.ClassName=='mmui::MessageView']
         if not mvs: return chat_name, []
@@ -197,91 +219,97 @@ class FreshNav:
         return chat_name, lst.GetChildren()
 
     @staticmethod
-    def get_search_edit():
-        """返回搜索框 EditControl"""
-        sp = FreshNav._nav_splitter()
-        if not sp: return None
-        lefts = [c for c in sp.GetChildren() if c.ClassName=='mmui::XView']
-        if not lefts: return None
-        cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
-        cl = cmv.GroupControl(ClassName='mmui::XView')
-        sf = cl.GroupControl(ClassName='mmui::XSearchField')
-        return sf.EditControl(ClassName='mmui::XValidatorTextEdit')
+    def get_session_table():
+        """获取左侧会话列表"""
+        outer = FreshNav._nav_outer_splitter()
+        if not outer: return None
+        try:
+            children = outer.GetChildren()
+            lefts = [c for c in children if c.ClassName=='mmui::XView']
+            if not lefts: return None
+            cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
+            cl = cmv.GroupControl(ClassName='mmui::XView')
+            ar = [c for c in cl.GetChildren() if c.ClassName=='mmui::XView']
+            if len(ar)<2: return None
+            li = ar[1].GroupControl(ClassName='mmui::XView')
+            sl = li.GroupControl(ClassName='mmui::ChatSessionList')
+            return sl.ListControl(ClassName='mmui::XTableView')
+        except: return None
 
     @staticmethod
-    def get_session_table():
-        sp = FreshNav._nav_splitter()
-        if not sp: return None
-        lefts = [c for c in sp.GetChildren() if c.ClassName=='mmui::XView']
-        if not lefts: return None
-        cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
-        cl = cmv.GroupControl(ClassName='mmui::XView')
-        ar = [c for c in cl.GetChildren() if c.ClassName=='mmui::XView']
-        if len(ar)<2: return None
-        li = ar[1].GroupControl(ClassName='mmui::XView')
-        sl = li.GroupControl(ClassName='mmui::ChatSessionList')
-        return sl.ListControl(ClassName='mmui::XTableView')
+    def get_search_edit():
+        """返回搜索框"""
+        outer = FreshNav._nav_outer_splitter()
+        if not outer: return None
+        try:
+            children = outer.GetChildren()
+            lefts = [c for c in children if c.ClassName=='mmui::XView']
+            if not lefts: return None
+            cmv = lefts[0].GroupControl(ClassName='mmui::ChatMasterView')
+            cl = cmv.GroupControl(ClassName='mmui::XView')
+            sf = cl.GroupControl(ClassName='mmui::XSearchField')
+            return sf.EditControl(ClassName='mmui::XValidatorTextEdit')
+        except: return None
 
     @staticmethod
     def get_input_field():
-        """返回输入框 EditControl (UIA方式)"""
-        sp = FreshNav._nav_splitter()
-        if not sp: return None
-        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
-        if not rights: return None
-        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
-        cp = cd.GetFirstChildControl()
-        if cp.ClassName != 'mmui::ChatMessagePage': return None
-        split = cp.CustomControl(ClassName='mmui::XSplitterView')
-        xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
-        if not xvs: return None
-        ig = xvs[0].GroupControl(ClassName='mmui::InputView')
-        xv2 = ig.GroupControl(ClassName='mmui::XView')
-        ixv = xv2.GroupControl(ClassName='mmui::XView')
-        return ixv.EditControl(ClassName='mmui::ChatInputField')
+        """返回输入框 EditControl"""
+        st = FreshNav._nav_right_panel()
+        if not st: return None
+        cp = FreshNav._get_chat_page(st)
+        if cp is None: return None
+        try:
+            split = cp.CustomControl(ClassName='mmui::XSplitterView')
+            xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
+            if not xvs: return None
+            ig = xvs[0].GroupControl(ClassName='mmui::InputView')
+            xv2 = ig.GroupControl(ClassName='mmui::XView')
+            ixv = xv2.GroupControl(ClassName='mmui::XView')
+            return ixv.EditControl(ClassName='mmui::ChatInputField')
+        except: return None
 
     @staticmethod
     def get_input_rect():
-        sp = FreshNav._nav_splitter()
-        if not sp: return None
-        rights = [c for c in sp.GetChildren() if c.ClassName=='mmui::XStackedWidget']
-        if not rights: return None
-        cd = rights[0].GroupControl(ClassName='mmui::ChatDetailView')
-        cp = cd.GetFirstChildControl()
-        if cp.ClassName!='mmui::ChatMessagePage': return None
-        split = cp.CustomControl(ClassName='mmui::XSplitterView')
-        xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
-        if not xvs: return None
-        r = xvs[0].BoundingRectangle
-        return (r.left, r.top, r.right, r.bottom)
+        """输入框坐标"""
+        st = FreshNav._nav_right_panel()
+        if not st: return None
+        cp = FreshNav._get_chat_page(st)
+        if cp is None: return None
+        try:
+            split = cp.CustomControl(ClassName='mmui::XSplitterView')
+            xvs = [c for c in split.GetChildren() if c.ClassName=='mmui::XView']
+            if not xvs: return None
+            r = xvs[0].BoundingRectangle
+            return (r.left, r.top, r.right, r.bottom)
+        except: return None
+
+    @staticmethod
+    def switch_to_chat_tab():
+        win = FreshNav._try_uia()
+        if not win: return
+        root = win.GroupControl(searchDepth=1)
+        stacked = root.CustomControl(ClassName='QStackedWidget')
+        mv = stacked.GroupControl(ClassName='mmui::MainView')
+        nav = mv.ToolBarControl(ClassName='mmui::MainTabBar')
+        nav.ButtonControl(Name='微信').Click(simulateMove=False)
 
 
 # ==================== 数据模型 ====================
 
 class Rule:
-    """单条回复规则"""
-    __slots__ = ('chat', 'keyword', 'reply', 'enabled')
+    __slots__ = ('chat','keyword','reply','enabled')
     def __init__(self, chat='', keyword='', reply='', enabled=True):
-        self.chat = chat
-        self.keyword = keyword
-        self.reply = reply
-        self.enabled = enabled
-
+        self.chat = chat; self.keyword = keyword; self.reply = reply; self.enabled = enabled
     def to_dict(self):
-        return {'chat': self.chat, 'keyword': self.keyword,
-                'reply': self.reply, 'enabled': self.enabled}
-
+        return {'chat':self.chat,'keyword':self.keyword,'reply':self.reply,'enabled':self.enabled}
     @staticmethod
     def from_dict(d):
-        return Rule(d.get('chat',''), d.get('keyword',''),
-                    d.get('reply',''), d.get('enabled',True))
-
+        return Rule(d.get('chat',''), d.get('keyword',''), d.get('reply',''), d.get('enabled',True))
 
 class RawMsg:
     __slots__ = ('cls','name','runtime_id')
     def __init__(self, item):
-        self.cls = item.ClassName
-        self.name = item.Name or ''
+        self.cls = item.ClassName; self.name = item.Name or ''
         try: self.runtime_id = ''.join(str(i) for i in item.GetRuntimeId())
         except: self.runtime_id = ''
     @property
@@ -292,8 +320,6 @@ class RawMsg:
     def content_hash(self):
         return hashlib.md5(self.name.encode('utf-8','replace')).hexdigest()[:16]
 
-
-# ==================== 监控引擎 ====================
 
 class MonitorEngine:
     """自动回复引擎 — 支持 once / loop 模式"""
@@ -452,7 +478,7 @@ class MonitorEngine:
         init_com()
         uia.SetGlobalSearchTimeout(2)
 
-        # 快速路径: 当前已是目标聊天(不切窗口)
+        # 快速路径: 当前已是目标聊天
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
@@ -460,132 +486,92 @@ class MonitorEngine:
                 return True
         except: pass
 
-        # 需要切换聊天 → 切前台
         focus_wechat()
         time.sleep(0.05)
 
-        # ---- 方法1: 可见列表 + 翻页 ----
+        # ---- 方法1: 可见列表扫描 ----
         table = FreshNav.get_session_table()
-        if not table:
-            return False
+        if table:
+            for _ in range(25):
+                table.WheelUp(wheelTimes=20, waitTime=0.002, interval=0.002)
+            time.sleep(0.15)
+            seen = set()
+            for scan in range(30):
+                table = FreshNav.get_session_table()
+                if not table: break
+                for item in table.GetChildren():
+                    n = item.Name.split('\n')[0]; seen.add(n)
+                    if who == n:
+                        r = item.BoundingRectangle
+                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+                        time.sleep(0.2)
+                        return True
+                table.WheelDown(wheelTimes=6, waitTime=0.02, interval=0.015)
+                time.sleep(0.2)
+                if len(seen) == len(set(n for item in table.GetChildren()
+                                       if (n:=item.Name.split('\n')[0]) in seen)):
+                    break
 
-        # 先滚到顶
-        for _ in range(25):
-            table.WheelUp(wheelTimes=20, waitTime=0.002, interval=0.002)
-        time.sleep(0.15)
+        # ---- 方法2: 全窗口搜索 ChatSessionCell 列表 ----
+        self.log('[SEARCH] 全窗口搜索: {}'.format(who[:10]))
 
-        seen = set()
-        for scan in range(30):
-            table = FreshNav.get_session_table()
-            if not table: break
-            items = table.GetChildren()
-            cur = set()
-            for item in items:
-                n = item.Name.split('\n')[0]
-                cur.add(n)
-                if who == n:
-                    r = item.BoundingRectangle
-                    mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                    time.sleep(0.2)
-                    return FreshNav._nav_splitter() is not None
-            if cur.issubset(seen): break
-            seen.update(cur)
-            # 慢速翻: 每次6个 wheel, 间隔更长
-            table.WheelDown(wheelTimes=6, waitTime=0.02, interval=0.015)
-            time.sleep(0.2)
-
-        # ---- 方法2: 搜索框 ----
-        self.log('[SEARCH] 滚动未找到 {}, 用搜索框'.format(who[:10]))
-        search_edit = FreshNav.get_search_edit()
-        if not search_edit:
-            return False
-
-        # 先点击搜索框获得焦点
-        search_edit.Click(simulateMove=False)
-        time.sleep(0.1)
-
-        # 清空
-        search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
-        time.sleep(0.05)
-
-        # 方式1: ValuePattern.SetValue(最可靠)
+        # 先点「微信」标签按钮, 确保左侧面板可见
         try:
-            vp = search_edit.GetValuePattern()
-            if vp:
-                vp.SetValue(who)
-                time.sleep(0.1)
-                # 触发一下搜索过滤(发送一个key event触发list刷新)
-                search_edit.SendKeys('{End}', waitTime=0.05)
-                time.sleep(0.05)
-                search_edit.SendKeys('{Back}', waitTime=0.05)
-                # 再设置一次确保
-                time.sleep(0.1)
-                if vp.Value != who:
-                    vp.SetValue(who)
-                    time.sleep(0.1)
-                self.log('[SEARCH] ValuePattern set: {!r}'.format(vp.Value[:20]))
-        except Exception as e:
-            self.log('[SEARCH] ValuePattern失败: {}, 用剪贴板'.format(e))
-            # 方式2: 剪贴板粘贴
+            FreshNav.switch_to_chat_tab()
+            time.sleep(0.2)
+        except: pass
+
+        # 尝试用搜索框(如果XView可用)
+        search_edit = FreshNav.get_search_edit()
+        if search_edit:
+            search_edit.Click(simulateMove=False); time.sleep(0.1)
             pyperclip.copy(who)
+            search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
             time.sleep(0.05)
             search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
+            time.sleep(0.8)
 
-        time.sleep(0.8)
+        # 全窗口遍历 ChatSessionCell
+        items = []
+        win = FreshNav._try_uia()
+        if win:
+            def _cells(ele):
+                r = []
+                try:
+                    if ele.ControlTypeName=='ListItemControl' and 'ChatSessionCell' in (ele.ClassName or ''):
+                        r.append(ele)
+                    for c in ele.GetChildren():
+                        r.extend(_cells(c))
+                except: pass
+                return r
+            items = _cells(win)
 
-        # 获取搜索过滤后的列表
-        table = FreshNav.get_session_table()
-        if not table:
-            self.log('[SEARCH] 搜索后无法获取会话列表')
-            try: search_edit.SendKeys('{Ctrl}a{Back}')
-            except: pass
-            return False
-
-        items = table.GetChildren()
-
-        # 如果列表还是空的, 等一等再试
-        if not items:
-            time.sleep(0.5)
-            table = FreshNav.get_session_table()
-            if table:
-                items = table.GetChildren()
-
-        if not items:
-            self.log('[SEARCH] 搜索结果为空, 没有对应会话')
-            try: search_edit.SendKeys('{Ctrl}a{Back}')
-            except: pass
-            return False
-
-        # 在结果列表中按名称匹配(精确 > 包含 > 第一条)
+        # 名称匹配
         best = None
         for item in items:
             n = item.Name.split('\n')[0]
-            if who == n:
-                best = item
-                break
+            if who == n: best = item; break
             if who in n or n in who:
-                if best is None:
-                    best = item
+                if best is None: best = item
+        if best is not None:
+            n = best.Name.split('\n')[0]
+            self.log('[SEARCH] 点击: {}'.format(n[:40]))
+            r = best.BoundingRectangle
+            mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+            time.sleep(0.2)
 
-        if best is None:
-            self.log('[SEARCH] 搜索结果({}条)无名称匹配: {}'.format(len(items), [i.Name.split(chr(10))[0][:20] for i in items[:5]]))
-            try: search_edit.SendKeys('{Ctrl}a{Back}')
-            except: pass
-            return False
+        # 清除搜索
+        if search_edit:
+            search_edit.SendKeys('{Ctrl}a{Back}'); time.sleep(0.1)
 
-        n = best.Name.split('\n')[0]
-        self.log('[SEARCH] 点击: {}'.format(n[:40]))
-        r = best.BoundingRectangle
-        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-        time.sleep(0.2)
-
-        # 清除搜索框
+        # 验证
         try:
-            search_edit.SendKeys('{Ctrl}a{Back}')
+            cur, _ = FreshNav.get_message_items()
+            if cur and cur.strip() == who.strip():
+                self.status['current_chat'] = cur
+                return True
         except: pass
-        time.sleep(0.1)
-
-        return FreshNav._nav_splitter() is not None
+        return False
 
     def _send_reply(self, text):
         # 抢焦点到微信
@@ -954,8 +940,8 @@ class AutoReplyUI:
 
         self.root = tk.Tk()
         self.root.title('wxauto 自动回复监控')
-        self.root.geometry('920x820')
-        self.root.minsize(850, 650)
+        self.root.geometry('1440x920')
+        self.root.minsize(900, 650)
         self.root.configure(bg=self.C['bg'])
 
         self._build_ui()
