@@ -508,7 +508,7 @@ class MonitorEngine:
         return False
 
     def __open_chat(self, who):
-        """打开聊天: 已在目标→不切; 首次→Ctrl+F; 多聊天时此方法每轮调用"""
+        """打开聊天: 已在目标→不切; 首次→Ctrl+F→验证; 最多重试3次"""
         init_com()
 
         # 已在目标 → 不操作
@@ -520,19 +520,33 @@ class MonitorEngine:
                 return True
         except: pass
 
-        focus_wechat(); time.sleep(0.05)
+        for attempt in range(3):
+            if attempt > 0:
+                self.log('[RETRY] 第{}次重试打开: {}'.format(attempt+1, who[:12]))
+                time.sleep(0.5)
 
-        # Ctrl+F 搜索 + Enter 打开
-        uia.SendKeys("{Ctrl}f", waitTime=0.1)
-        time.sleep(0.2)
-        pyperclip.copy(who)
-        uia.SendKeys("{Ctrl}v", waitTime=0.05)
-        time.sleep(0.25)
-        uia.SendKeys("{Enter}", waitTime=0.05)
-        time.sleep(0.5)
-        self.pinned_chats.add(who)
-        self.status["current_chat"] = who
-        return True
+            focus_wechat(); time.sleep(0.08)
+
+            # Ctrl+F 搜索 + Enter 打开
+            uia.SendKeys("{Ctrl}f", waitTime=0.1)
+            time.sleep(0.3)
+            pyperclip.copy(who)
+            uia.SendKeys("{Ctrl}v", waitTime=0.05)
+            time.sleep(0.35)
+            uia.SendKeys("{Enter}", waitTime=0.05)
+            time.sleep(0.8)
+
+            # 验证是否真的打开了
+            try:
+                cur_name, _ = FreshNav.get_message_items()
+                if cur_name and cur_name.strip() == who.strip():
+                    self.pinned_chats.add(who)
+                    self.status["current_chat"] = who
+                    return True
+            except: pass
+
+        self.log('[FAIL] 3次重试均无法打开: {}'.format(who[:20]))
+        return False
     def _send_reply(self, text):
         # 抢焦点到微信
         focus_wechat()
