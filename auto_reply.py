@@ -211,11 +211,21 @@ class FreshNav:
             except: pass
             return None
         chat_name = find_name(tb)
-        # 消息列表
+        # 消息列表 (4.1.10: XVBoxView包裹MessageView, 需要递归找)
         split = cp.CustomControl(ClassName='mmui::XSplitterView')
-        mvs = [c for c in split.GetChildren() if c.ClassName=='mmui::MessageView']
-        if not mvs: return chat_name, []
-        lst = mvs[0].ListControl(ClassName='mmui::RecyclerListView')
+        # 递归找 MessageView
+        def _find_msg_view(ele):
+            try:
+                if ele.ClassName == 'mmui::MessageView':
+                    return ele
+                for c in ele.GetChildren():
+                    r = _find_msg_view(c)
+                    if r: return r
+            except: pass
+            return None
+        mv = _find_msg_view(split)
+        if not mv: return chat_name, []
+        lst = mv.ListControl(ClassName='mmui::RecyclerListView')
         return chat_name, lst.GetChildren()
 
     @staticmethod
@@ -474,49 +484,84 @@ class MonitorEngine:
             self.log('[ERR] _open_chat失败: {}'.format(str(e)[:50]))
             return False
 
+
     def __open_chat(self, who):
         init_com()
         uia.SetGlobalSearchTimeout(2)
-        # 快速路径
+        # fast path
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
                 self.status['current_chat'] = cur_name
                 return True
         except: pass
-        focus_wechat(); time.sleep(0.05)
-        # 全窗口找 ChatSessionCell
-        def _cells(win):
-            r=[]
+        focus_wechat()
+        time.sleep(0.05)
+
+        def _cells():
+            win = FreshNav._try_uia()
+            if not win: return []
+            r = []
             def rec(ele):
                 try:
-                    if ele.ControlTypeName=='ListItemControl' and 'ChatSessionCell' in (ele.ClassName or ''):
+                    if (ele.ControlTypeName == 'ListItemControl' and
+                        ele.ClassName and 'ChatSessionCell' in ele.ClassName):
                         r.append(ele)
-                    for cc in ele.GetChildren(): rec(cc)
                 except: pass
-            rec(win); return r
-        win = FreshNav._try_uia()
-        if not win: return False
-        cells = _cells(win)
-        # 先检查当前可见
-        for c in cells:
-            if c.Name.split(chr(10))[0] == who:
-                r=c.BoundingRectangle; mouse_click((r.left+r.right)//2,(r.top+r.bottom)//2)
-                time.sleep(0.2); return True
-        # 翻页搜索 (最多25页向下 + 5页向上)
+                try:
+                    for cc in ele.GetChildren():
+                        rec(cc)
+                except: pass
+            rec(win)
+            return r
+
+        def _click(cells, who):
+            for c in cells:
+                try:
+                    n = c.Name.split(chr(10))[0]
+                    if n.strip() == who:
+                        r = c.BoundingRectangle
+                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+                        time.sleep(0.25)
+                        return True
+                except: pass
+            return False
+
+        cells = _cells()
+        if _click(cells, who):
+            cur, _ = FreshNav.get_message_items()
+            if cur: self.status['current_chat'] = cur
+            return True
+
         h = get_hwnd()
-        if h and cells:
-            for direction in ['down','up']:
-                for _ in range(25 if direction=='down' else 5):
-                    r0=cells[0].BoundingRectangle; cx=(r0.left+r0.right)//2; cy=(r0.top+r0.bottom)//2
-                    delta = (-120*10) if direction=='down' else (120*10)
-                    ctypes.windll.user32.PostMessageW(h, 0x020A, delta<<16, (cy<<16)|cx)
-                    time.sleep(0.3)
-                    win=FreshNav._try_uia(); cells=_cells(win) if win else []
-                    for c in cells:
-                        if c.Name.split(chr(10))[0] == who:
-                            r=c.BoundingRectangle; mouse_click((r.left+r.right)//2,(r.top+r.bottom)//2)
-                            time.sleep(0.2); return True
+        old_cell_names = set()
+        for c in cells:
+            try: old_cell_names.add(c.Name.split(chr(10))[0])
+            except: pass
+
+        for page in range(30):
+            if not h or not cells:
+                break
+            r0 = cells[0].BoundingRectangle
+            cx = (r0.left+r0.right)//2
+            cy = (r0.top+r0.bottom)//2
+            ctypes.windll.user32.PostMessageW(h, 0x020A, (-120*15)<<16, (cy<<16)|cx)
+            time.sleep(0.3)
+            cells = _cells()
+            if not cells:
+                break
+            if _click(cells, who):
+                cur, _ = FreshNav.get_message_items()
+                if cur: self.status['current_chat'] = cur
+                return True
+            new_names = set()
+            for c in cells:
+                try: new_names.add(c.Name.split(chr(10))[0])
+                except: pass
+            if new_names.issubset(old_cell_names):
+                break
+            old_cell_names = new_names
+
         return False
 
     def _send_reply(self, text):
