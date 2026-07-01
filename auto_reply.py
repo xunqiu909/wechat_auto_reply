@@ -464,6 +464,13 @@ class MonitorEngine:
 
     # ---- 核心操作 ----
 
+    def _on_target(self, who):
+        """检查当前是否已在目标聊天(纯读UIA, 不切不点击)"""
+        try:
+            cur_name, _ = FreshNav.get_message_items()
+            return cur_name and cur_name.strip() == who.strip()
+        except: return False
+
     def _open_chat(self, who):
         """打开指定会话: 可见列表→翻页→搜索框"""
         try:
@@ -501,9 +508,10 @@ class MonitorEngine:
         return False
 
     def __open_chat(self, who):
+        """智能打开聊天: 已在目标→不切; 已浮顶→点单元格; 首次→Ctrl+F"""
         init_com()
 
-        # 1. 快速路径: 当前已在目标聊天 → 直接读消息, 不切不搜
+        # 已在目标聊天 → 直接返回(不切屏不操作)
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
@@ -512,14 +520,14 @@ class MonitorEngine:
                 return True
         except: pass
 
-        # 2. 需要切换 → 切前台
+        # 需要切换 → 切前台
         focus_wechat(); time.sleep(0.05)
 
-        # 3. 已浮到顶部的聊天 → 直接点击可见单元格
+        # 已浮到顶部的聊天 → 直接点击可见单元格
         if who in self.pinned_chats and self._click_visible_cell(who):
             return True
 
-        # 4. 首次打开 → Ctrl+F 搜索 (打开后浮到顶部)
+        # 首次打开 → Ctrl+F 搜索
         uia.SendKeys("{Ctrl}f", waitTime=0.1)
         time.sleep(0.2)
         pyperclip.copy(who)
@@ -728,28 +736,23 @@ class MonitorEngine:
                     slept += 1
 
     def _poll_all_rules(self, rules, is_once):
-        """
-        每轮检测: 按聊天分组, 每个聊天只看最后一条 incoming,
-        匹配任一条规则 → 回复该规则的回复内容 → 本条聊天结束。
-        """
+        """按聊天分组检测。单聊天: 首轮打开后静默读; 多聊天: 每轮切换"""
         grouped = {}
         for idx, rule in enumerate(rules):
             grouped.setdefault(rule.chat, []).append((idx, rule))
 
-        single_chat = (len(grouped) == 1)  # 只有一个聊天对象时优化
+        single_chat = (len(grouped) == 1)
 
         for chat, rule_list in grouped.items():
             if self.stop_requested: break
 
-            # 1. 打开聊天 (单聊天时只在首轮打开, 后续轮直接读)
-            should_skip = False
+            # 打开聊天 (单聊天+已在上方: 直接读消息, 不切屏)
             if single_chat and chat in self.pinned_chats:
-                try:
-                    cur, _ = FreshNav.get_message_items()
-                    if cur and cur.strip() == chat.strip():
-                        should_skip = True
-                except: pass
-            if not should_skip:
+                if not self._on_target(chat):
+                    if not self._open_chat(chat):
+                        self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
+                        continue
+            else:
                 if not self._open_chat(chat):
                     self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                     continue
