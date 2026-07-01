@@ -474,17 +474,15 @@ class MonitorEngine:
 
     def __open_chat(self, who):
         init_com()
-        if self.status.get("current_chat","") == who: return True
-        focus_wechat()
-        time.sleep(0.1)
-        # Ctrl+F to focus search bar -> paste -> Enter to open
+        focus_wechat(); time.sleep(0.1)
+        # Ctrl+F >> paste name >> Enter (chat floats to top of list)
         uia.SendKeys("{Ctrl}f", waitTime=0.1)
-        time.sleep(0.35)
+        time.sleep(0.25)
         pyperclip.copy(who)
         uia.SendKeys("{Ctrl}v", waitTime=0.05)
-        time.sleep(0.4)
+        time.sleep(0.3)
         uia.SendKeys("{Enter}", waitTime=0.05)
-        time.sleep(0.8)
+        time.sleep(0.6)
         self.status["current_chat"] = who
         return True
     def _send_reply(self, text):
@@ -701,17 +699,12 @@ class MonitorEngine:
                 continue
             time.sleep(0.1)
 
-            # 2. 取消息 (重试最多2秒)
-            cur_name = None; items = []
-            for retry in range(10):
-                cur_name, items = FreshNav.get_message_items()
-                if cur_name and items: break
-                time.sleep(0.2)
+            # 2. 取最后一条 incoming 消息
+            cur_name, items = FreshNav.get_message_items()
             if not cur_name or cur_name.strip() != chat.strip():
-                self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}] msg={}'.format(chat, cur_name, len(items)))
+                self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
                 continue
 
-            # 取最后一条文本消息(包含自己发的, 用于刷新去重)
             latest = None
             for item in reversed(list(items)):
                 msg = RawMsg(item)
@@ -719,12 +712,9 @@ class MonitorEngine:
                     continue
                 latest = msg
                 break
-
             if latest is None:
-                self.log('[POLL] 聊天: {} 无消息'.format(chat))
                 continue
 
-            # 解析发送人 (群聊: "sender_id\ncontent", 单聊: 纯 "content")
             full = latest.name
             sender = ''
             content = full
@@ -734,36 +724,26 @@ class MonitorEngine:
                 content = parts[1] if len(parts) > 1 else full
 
             is_self = self._is_self(full)
-            if is_self:
-                self.log('[POLL] 聊天: {} 最后消息: {!r} (自己)'.format(chat, full[:50]))
-            elif sender:
-                self.log('[POLL] 聊天: {} 发送人:{} 最后消息: {!r}'.format(chat, sender, content[:50]))
-            else:
-                self.log('[POLL] 聊天: {} 最后消息: {!r}'.format(chat, content[:60]))
-
-            # 3. 和上次相同(聊天+发送人+文本) → 跳过
-            dedup_key = '{}|{}|{}'.format(chat, sender, content.strip())
-            prev = self.last_incoming.get(chat, '')
-            if dedup_key == prev:
-                self.log('[DEDUP] 最后消息未变 ({}) -> SKIP'.format(prev[:40]))
-                continue
-            self.last_incoming[chat] = dedup_key
-
             self.status['current_chat'] = chat
             self.status['last_message'] = content[:60]
 
-            # 4. 自己发的不触发规则, 但已刷新去重
+            # 3. 去重: 和上次相同则跳过
+            dedup_key = '{}|{}|{}'.format(chat, sender, content.strip())
+            if dedup_key == self.last_incoming.get(chat, ''):
+                continue
+            self.last_incoming[chat] = dedup_key
+
+            # 4. 不回复自己
             if is_self:
                 continue
 
-            # 5. 逐条规则匹配(对 content 做关键词匹配)
+            # 5. 逐条规则匹配
             for idx, rule in rule_list:
                 if not self._match_kw(content, rule.keyword):
                     continue
                 if not rule.reply.strip():
                     continue
                 if rule.reply.strip() in full:
-                    self.log('[SKIP] 防循环: {!r}'.format(rule.reply[:20]))
                     continue
 
                 self.log('[KEYWORD] 触发! [{}] kw={!r}'.format(chat, rule.keyword))
@@ -774,7 +754,7 @@ class MonitorEngine:
                     self.status['last_send'] = '成功'
                 else:
                     self.status['last_send'] = '失败'
-                break  # 一条匹配即止
+                break  # 每条消息只回复一次
 
 
 # ==================== Tkinter UI ====================
