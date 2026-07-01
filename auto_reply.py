@@ -477,100 +477,46 @@ class MonitorEngine:
     def __open_chat(self, who):
         init_com()
         uia.SetGlobalSearchTimeout(2)
-
-        # 快速路径: 当前已是目标聊天
+        # 快速路径
         try:
             cur_name, _ = FreshNav.get_message_items()
             if cur_name and cur_name.strip() == who.strip():
                 self.status['current_chat'] = cur_name
                 return True
         except: pass
-
-        focus_wechat()
-        time.sleep(0.05)
-
-        # ---- 方法1: 可见列表扫描 ----
-        table = FreshNav.get_session_table()
-        if table:
-            for _ in range(25):
-                table.WheelUp(wheelTimes=20, waitTime=0.002, interval=0.002)
-            time.sleep(0.15)
-            seen = set()
-            for scan in range(30):
-                table = FreshNav.get_session_table()
-                if not table: break
-                for item in table.GetChildren():
-                    n = item.Name.split('\n')[0]; seen.add(n)
-                    if who == n:
-                        r = item.BoundingRectangle
-                        mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                        time.sleep(0.2)
-                        return True
-                table.WheelDown(wheelTimes=6, waitTime=0.02, interval=0.015)
-                time.sleep(0.2)
-                if len(seen) == len(set(n for item in table.GetChildren()
-                                       if (n:=item.Name.split('\n')[0]) in seen)):
-                    break
-
-        # ---- 方法2: 全窗口搜索 ChatSessionCell 列表 ----
-        self.log('[SEARCH] 全窗口搜索: {}'.format(who[:10]))
-
-        # 先点「微信」标签按钮, 确保左侧面板可见
-        try:
-            FreshNav.switch_to_chat_tab()
-            time.sleep(0.2)
-        except: pass
-
-        # 尝试用搜索框(如果XView可用)
-        search_edit = FreshNav.get_search_edit()
-        if search_edit:
-            search_edit.Click(simulateMove=False); time.sleep(0.1)
-            pyperclip.copy(who)
-            search_edit.SendKeys('{Ctrl}a{Back}', waitTime=0.05)
-            time.sleep(0.05)
-            search_edit.SendKeys('{Ctrl}v', waitTime=0.05)
-            time.sleep(0.8)
-
-        # 全窗口遍历 ChatSessionCell
-        items = []
-        win = FreshNav._try_uia()
-        if win:
-            def _cells(ele):
-                r = []
+        focus_wechat(); time.sleep(0.05)
+        # 全窗口找 ChatSessionCell
+        def _cells(win):
+            r=[]
+            def rec(ele):
                 try:
                     if ele.ControlTypeName=='ListItemControl' and 'ChatSessionCell' in (ele.ClassName or ''):
                         r.append(ele)
-                    for c in ele.GetChildren():
-                        r.extend(_cells(c))
+                    for cc in ele.GetChildren(): rec(cc)
                 except: pass
-                return r
-            items = _cells(win)
-
-        # 名称匹配
-        best = None
-        for item in items:
-            n = item.Name.split('\n')[0]
-            if who == n: best = item; break
-            if who in n or n in who:
-                if best is None: best = item
-        if best is not None:
-            n = best.Name.split('\n')[0]
-            self.log('[SEARCH] 点击: {}'.format(n[:40]))
-            r = best.BoundingRectangle
-            mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-            time.sleep(0.2)
-
-        # 清除搜索
-        if search_edit:
-            search_edit.SendKeys('{Ctrl}a{Back}'); time.sleep(0.1)
-
-        # 验证
-        try:
-            cur, _ = FreshNav.get_message_items()
-            if cur and cur.strip() == who.strip():
-                self.status['current_chat'] = cur
-                return True
-        except: pass
+            rec(win); return r
+        win = FreshNav._try_uia()
+        if not win: return False
+        cells = _cells(win)
+        # 先检查当前可见
+        for c in cells:
+            if c.Name.split(chr(10))[0] == who:
+                r=c.BoundingRectangle; mouse_click((r.left+r.right)//2,(r.top+r.bottom)//2)
+                time.sleep(0.2); return True
+        # 翻页搜索 (最多25页向下 + 5页向上)
+        h = get_hwnd()
+        if h and cells:
+            for direction in ['down','up']:
+                for _ in range(25 if direction=='down' else 5):
+                    r0=cells[0].BoundingRectangle; cx=(r0.left+r0.right)//2; cy=(r0.top+r0.bottom)//2
+                    delta = (-120*10) if direction=='down' else (120*10)
+                    ctypes.windll.user32.PostMessageW(h, 0x020A, delta<<16, (cy<<16)|cx)
+                    time.sleep(0.3)
+                    win=FreshNav._try_uia(); cells=_cells(win) if win else []
+                    for c in cells:
+                        if c.Name.split(chr(10))[0] == who:
+                            r=c.BoundingRectangle; mouse_click((r.left+r.right)//2,(r.top+r.bottom)//2)
+                            time.sleep(0.2); return True
         return False
 
     def _send_reply(self, text):
