@@ -169,26 +169,13 @@ class FreshNav:
 
     @staticmethod
     def _get_chat_page(st):
-        """从右侧 XStackedWidget 获取 ChatMessagePage (兼容4.1.8和4.1.10)"""
+        """从右侧 XStackedWidget 获取 ChatMessagePage"""
         if not st: return None
-        # 先快速路径: 直接子控件 (4.1.10+, 无 ChatDetailView 包裹)
         try:
-            children = st.GetChildren()
-            if children:
-                for c in children:
-                    if c.ClassName == 'mmui::ChatMessagePage':
-                        return c
+            for c in st.GetChildren():
+                if c.ClassName == 'mmui::ChatMessagePage':
+                    return c
         except: pass
-        # 4.1.8: ChatDetailView 包裹 (带短超时避免卡死)
-        try:
-            uia.SetGlobalSearchTimeout(0.5)
-            cd = st.GroupControl(ClassName='mmui::ChatDetailView')
-            cp = cd.GetFirstChildControl()
-            if cp and cp.ClassName == 'mmui::ChatMessagePage':
-                return cp
-        except: pass
-        finally:
-            uia.SetGlobalSearchTimeout(5)
         return None
 
     @staticmethod
@@ -488,17 +475,12 @@ class MonitorEngine:
     def __open_chat(self, who):
         init_com()
         uia.SetGlobalSearchTimeout(2)
-        # fast path
-        try:
-            cur_name, _ = FreshNav.get_message_items()
-            if cur_name and cur_name.strip() == who.strip():
-                self.status['current_chat'] = cur_name
-                return True
-        except: pass
+        if self.status.get('current_chat', '') == who:
+            return True
         focus_wechat()
         time.sleep(0.05)
 
-        def _cells():
+        def _all_cells():
             win = FreshNav._try_uia()
             if not win: return []
             r = []
@@ -515,7 +497,7 @@ class MonitorEngine:
             rec(win)
             return r
 
-        def _click(cells, who):
+        def _click_cell(cells, who):
             for c in cells:
                 try:
                     n = c.Name.split(chr(10))[0]
@@ -523,44 +505,40 @@ class MonitorEngine:
                         r = c.BoundingRectangle
                         mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
                         time.sleep(0.25)
+                        self.status['current_chat'] = who
                         return True
                 except: pass
             return False
 
-        cells = _cells()
-        if _click(cells, who):
-            cur, _ = FreshNav.get_message_items()
-            if cur: self.status['current_chat'] = cur
+        cells = _all_cells()
+        if _click_cell(cells, who):
             return True
 
-        h = get_hwnd()
-        old_cell_names = set()
-        for c in cells:
-            try: old_cell_names.add(c.Name.split(chr(10))[0])
-            except: pass
+        # Click first cell to focus the list, then use PgDn/PgUp
+        import ctypes
+        VK_NEXT = 0x22  # PgDn
+        VK_PRIOR = 0x21  # PgUp
 
-        for page in range(30):
-            if not h or not cells:
-                break
+        if cells:
             r0 = cells[0].BoundingRectangle
-            cx = (r0.left+r0.right)//2
-            cy = (r0.top+r0.bottom)//2
-            ctypes.windll.user32.PostMessageW(h, 0x020A, (-120*15)<<16, (cy<<16)|cx)
-            time.sleep(0.3)
-            cells = _cells()
-            if not cells:
-                break
-            if _click(cells, who):
-                cur, _ = FreshNav.get_message_items()
-                if cur: self.status['current_chat'] = cur
+            mouse_click((r0.left+r0.right)//2, (r0.top+r0.bottom)//2)
+            time.sleep(0.15)
+
+        for step in range(30):
+            if step < 20:
+                # scroll down with PgDn
+                ctypes.windll.user32.keybd_event(VK_NEXT, 0, 0, 0)
+                time.sleep(0.03)
+                ctypes.windll.user32.keybd_event(VK_NEXT, 0, 2, 0)
+            else:
+                # scroll up with PgUp
+                ctypes.windll.user32.keybd_event(VK_PRIOR, 0, 0, 0)
+                time.sleep(0.03)
+                ctypes.windll.user32.keybd_event(VK_PRIOR, 0, 2, 0)
+            time.sleep(0.25)
+            cells = _all_cells()
+            if _click_cell(cells, who):
                 return True
-            new_names = set()
-            for c in cells:
-                try: new_names.add(c.Name.split(chr(10))[0])
-                except: pass
-            if new_names.issubset(old_cell_names):
-                break
-            old_cell_names = new_names
 
         return False
 
