@@ -333,7 +333,7 @@ class MonitorEngine:
         self.log_queue = queue.Queue()
 
         self.baseline_ids = {}
-        self.last_incoming = {}   # {chat: text} 上次已回复的 incoming 消息文本
+        self.pinned_chats = set()   # 已打开过的聊天(已浮到顶部),下次不用搜
         self.sent_texts = set()   # 自己发过的文本(防循环)
         self.stop_requested = False  # 用于 Ctrl+C / 超时 / 手动停止
 
@@ -472,17 +472,50 @@ class MonitorEngine:
             return False
 
 
+    def _click_visible_cell(self, who):
+        """在可见的 ChatSessionCell 中查找并点击目标聊天"""
+        win = FreshNav._try_uia()
+        if not win: return False
+        cells = []
+        def rec(ele):
+            try:
+                if (ele.ControlTypeName == 'ListItemControl' and
+                    ele.ClassName and 'ChatSessionCell' in ele.ClassName):
+                    cells.append(ele)
+            except: pass
+            try:
+                for cc in ele.GetChildren():
+                    rec(cc)
+            except: pass
+        rec(win)
+        for c in cells:
+            try:
+                if c.Name.split(chr(10))[0].strip() == who:
+                    r = c.BoundingRectangle
+                    mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
+                    time.sleep(0.3)
+                    self.status["current_chat"] = who
+                    return True
+            except: pass
+        return False
+
     def __open_chat(self, who):
         init_com()
-        focus_wechat(); time.sleep(0.1)
-        # Ctrl+F >> paste name >> Enter (chat floats to top of list)
+        focus_wechat(); time.sleep(0.05)
+
+        # 已打开过的聊天 → 直接点单元格 (已浮动到顶部可见区)
+        if who in self.pinned_chats and self._click_visible_cell(who):
+            return True
+
+        # 首次打开 → Ctrl+F 搜索 (打开后自动浮到顶部)
         uia.SendKeys("{Ctrl}f", waitTime=0.1)
-        time.sleep(0.25)
+        time.sleep(0.2)
         pyperclip.copy(who)
         uia.SendKeys("{Ctrl}v", waitTime=0.05)
-        time.sleep(0.3)
+        time.sleep(0.25)
         uia.SendKeys("{Enter}", waitTime=0.05)
-        time.sleep(0.6)
+        time.sleep(0.5)
+        self.pinned_chats.add(who)
         self.status["current_chat"] = who
         return True
     def _send_reply(self, text):
@@ -565,6 +598,7 @@ class MonitorEngine:
         time.sleep(0.3)
         self.baseline_ids.clear()
         self.last_incoming.clear()
+        self.pinned_chats.clear()  # 重新开始时清空
         self.sent_texts.clear()
         self.stop_requested = False
         self.status = {
