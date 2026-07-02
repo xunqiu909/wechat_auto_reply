@@ -9,6 +9,7 @@ __pycache__/
 *.bat
 @AutomationLog.txt
 auto_reply_config.json
+auto_reply_records.jsonl
 test_*.py
 explore_*.py
 auto_reply_presets.json

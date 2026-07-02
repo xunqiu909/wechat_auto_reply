@@ -6,6 +6,7 @@ wxauto 4.1 自动回复监控系统 v4
 预设: 保存/加载/删除 配置快照
 """
 import sys, os, json, time, threading, queue, hashlib, copy, ctypes, signal
+from collections import deque
 from ctypes import wintypes
 from datetime import datetime
 
@@ -23,6 +24,7 @@ MOD_WIN = 0x0008
 
 VK_Q     = 0x51
 VK_F12   = 0x7B
+VK_C     = 0x43
 WM_HOTKEY = 0x0312
 
 class GlobalHotkey:
@@ -132,6 +134,12 @@ def mouse_click(x, y):
 
 def get_hwnd():
     return win32gui.FindWindow(None, '微信') or win32gui.FindWindow('mmui::MainWindow', None)
+
+
+def app_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 # ==================== UIA 导航 ====================
@@ -345,23 +353,36 @@ class MonitorEngine:
         self.monitor_running = False
         self._thread = None
         self._lock = threading.Lock()
+        self._record_lock = threading.Lock()
+        self._hotkey_thread = None
+        self._hotkey_stop_event = threading.Event()
+        self._hotkey_latched = False
         self.log_queue = queue.Queue()
+        self.reply_record_queue = queue.Queue()
 
         self.baseline_ids = {}
         self.last_incoming = {}   # {chat: text} 上次已回复的消息
         self.pinned_chats = set()   # 已浮到顶部的聊天, 下次不用搜
+        self.prepared_chats = set()   # 启动时已预热到会话列表前方的聊天
         self.sent_texts = set()   # 自己发过的文本(防循环)
+        self.sent_text_order = []
         self.stop_requested = False  # 用于 Ctrl+C / 超时 / 手动停止
+        self._rules_version = 0
+        self._rule_cache_dirty = True
+        self._rule_groups_cache = {}
+        self._enabled_rules_cache = 0
+        self._records_version = 0
 
         self.status = {
             'mode': '检测一次', 'current_chat': '', 'last_message': '',
             'last_trigger': '', 'last_send': '', 'round': 0, 'total_rounds': 0,
+            'sent_ok': 0, 'sent_fail': 0, 'last_record_time': '',
         }
 
-        self.config_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'auto_reply_config.json')
-        self.presets_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'auto_reply_presets.json')
+        base_dir = app_base_dir()
+        self.config_path = os.path.join(base_dir, 'auto_reply_config.json')
+        self.presets_path = os.path.join(base_dir, 'auto_reply_presets.json')
+        self.reply_records_path = os.path.join(base_dir, 'auto_reply_records.jsonl')
 
     def log(self, msg):
         t = datetime.now().strftime('%H:%M:%S')
@@ -369,6 +390,144 @@ class MonitorEngine:
         self.log_queue.put(text)
         try: print(text)
         except: print(text.encode('ascii','replace').decode('ascii','replace'))
+
+    @property
+    def records_version(self):
+        return self._records_version
+
+    def _mark_rules_dirty(self):
+        self._rules_version += 1
+        self._rule_cache_dirty = True
+
+    def _get_rule_groups(self):
+        """返回按聊天分组后的启用规则快照，避免每轮重复归一化关键词。"""
+        with self._lock:
+            if self._rule_cache_dirty:
+                grouped = {}
+                enabled = 0
+                for idx, rule in enumerate(self.rules):
+                    if not rule.enabled:
+                        continue
+                    keyword_norm = self._normalize(rule.keyword)
+                    if not rule.chat.strip() or not keyword_norm or not rule.reply.strip():
+                        continue
+                    enabled += 1
+                    grouped.setdefault(rule.chat.strip(), []).append((idx, rule, keyword_norm))
+                self._rule_groups_cache = grouped
+                self._enabled_rules_cache = enabled
+                self._rule_cache_dirty = False
+            return ({chat: list(items) for chat, items in self._rule_groups_cache.items()},
+                    self._enabled_rules_cache, self._rules_version)
+
+    def enabled_rule_count(self):
+        _, enabled, _ = self._get_rule_groups()
+        return enabled
+
+    def _sleep_interruptible(self, seconds, step=0.05):
+        end_at = time.time() + max(float(seconds), 0)
+        while not self.stop_requested:
+            left = end_at - time.time()
+            if left <= 0:
+                break
+            time.sleep(min(step, left))
+
+    def _start_hotkey_watcher(self):
+        if self._hotkey_thread and self._hotkey_thread.is_alive():
+            self._hotkey_stop_event.clear()
+            return
+        self._hotkey_stop_event.clear()
+        self._hotkey_latched = False
+        self._hotkey_thread = threading.Thread(target=self._hotkey_watch_loop, daemon=True)
+        self._hotkey_thread.start()
+        self.log('[HOTKEY] Ctrl+Shift+C 全局检测线程已启动')
+
+    def _hotkey_watch_loop(self):
+        """轮询全局按键状态，避免依赖当前窗口焦点或 Tk 消息循环。"""
+        while not self._hotkey_stop_event.is_set():
+            try:
+                ctrl_down = bool(win32api.GetAsyncKeyState(win32con.VK_CONTROL) & 0x8000)
+                shift_down = bool(win32api.GetAsyncKeyState(win32con.VK_SHIFT) & 0x8000)
+                c_down = bool(win32api.GetAsyncKeyState(VK_C) & 0x8000)
+                pressed = ctrl_down and shift_down and c_down
+                if pressed and not self._hotkey_latched:
+                    self._hotkey_latched = True
+                    if self.monitor_running:
+                        self.log('[HOTKEY] Ctrl+Shift+C 已触发，强制退出循环')
+                        self.stop()
+                elif not pressed:
+                    self._hotkey_latched = False
+            except Exception as e:
+                self.log('[HOTKEY] 全局检测异常: {}'.format(str(e)[:60]))
+                break
+            time.sleep(0.05)
+
+    def _remember_sent(self, text):
+        text = (text or '').strip()
+        if not text:
+            return
+        if text not in self.sent_texts:
+            self.sent_text_order.append(text)
+        self.sent_texts.add(text)
+        while len(self.sent_text_order) > 200:
+            old = self.sent_text_order.pop(0)
+            self.sent_texts.discard(old)
+
+    def _record_reply(self, rule_index, rule, chat, sender, incoming, success):
+        record = {
+            'time': datetime.now().isoformat(timespec='seconds'),
+            'mode': self.mode,
+            'chat': chat,
+            'sender': sender,
+            'rule_index': rule_index + 1,
+            'keyword': rule.keyword,
+            'reply': rule.reply,
+            'incoming_message': incoming,
+            'success': bool(success),
+        }
+        try:
+            with self._record_lock:
+                with open(self.reply_records_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + '\n')
+                self._records_version += 1
+        except Exception as e:
+            self.log('[RECORD] 保存回复记录失败: {}'.format(str(e)[:60]))
+        else:
+            self.reply_record_queue.put(record)
+            if success:
+                self.status['sent_ok'] = self.status.get('sent_ok', 0) + 1
+            else:
+                self.status['sent_fail'] = self.status.get('sent_fail', 0) + 1
+            self.status['last_record_time'] = record['time'][11:19]
+
+    def load_reply_records(self, limit=200):
+        rows = deque(maxlen=max(int(limit), 1))
+        if not os.path.exists(self.reply_records_path):
+            return []
+        try:
+            with open(self.reply_records_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as e:
+            self.log('[RECORD] 读取回复记录失败: {}'.format(str(e)[:60]))
+        return list(rows)
+
+    def clear_reply_records(self):
+        try:
+            with self._record_lock:
+                with open(self.reply_records_path, 'w', encoding='utf-8'):
+                    pass
+                self._records_version += 1
+            self.log('[RECORD] 回复记录已清空')
+            return True
+        except Exception as e:
+            self.log('[RECORD] 清空回复记录失败: {}'.format(str(e)[:60]))
+            return False
 
     # ---- 配置读写 ----
 
@@ -382,6 +541,7 @@ class MonitorEngine:
                 self.active_duration = data.get('active_duration', 30)
                 self.pause_duration = data.get('pause_duration', 0)
                 self.rules = [Rule.from_dict(r) for r in data.get('rules', [])]
+                self._mark_rules_dirty()
                 self.log('已加载配置: {}模式, {} 条规则'.format(
                     '循环' if self.mode=='loop' else '单次', len(self.rules)))
                 return True
@@ -440,6 +600,7 @@ class MonitorEngine:
         self.active_duration = p.get('active_duration', 30)
         self.pause_duration = p.get('pause_duration', 0)
         self.rules = [Rule.from_dict(r) for r in p.get('rules', [])]
+        self._mark_rules_dirty()
         self.save_config()
         self.log('加载预设: {} ({}模式, {}条规则)'.format(name,
             '循环' if self.mode=='loop' else '单次', len(self.rules)))
@@ -458,6 +619,7 @@ class MonitorEngine:
     def add_rule(self, chat, keyword, reply):
         with self._lock:
             self.rules.append(Rule(chat, keyword, reply, True))
+            self._mark_rules_dirty()
             self.save_config()
             self.log('添加规则: {} | {} | {}...'.format(chat, keyword, reply[:25]))
 
@@ -465,6 +627,7 @@ class MonitorEngine:
         with self._lock:
             if 0 <= index < len(self.rules):
                 r = self.rules.pop(index)
+                self._mark_rules_dirty()
                 self.save_config()
                 self.log('删除规则: {} | {}'.format(r.chat, r.keyword))
 
@@ -475,7 +638,28 @@ class MonitorEngine:
                     self.rules[index].enabled = not self.rules[index].enabled
                 else:
                     self.rules[index].enabled = enabled
+                self._mark_rules_dirty()
                 self.save_config()
+
+    def update_rule(self, index, chat, keyword, reply):
+        with self._lock:
+            if not (0 <= index < len(self.rules)):
+                return False
+            self.rules[index].chat = chat
+            self.rules[index].keyword = keyword
+            self.rules[index].reply = reply
+            self._mark_rules_dirty()
+            self.save_config()
+        self.log('更新规则#{}: {} | {}'.format(index+1, chat, keyword))
+        return True
+
+    def set_all_rules(self, enabled):
+        with self._lock:
+            for rule in self.rules:
+                rule.enabled = enabled
+            self._mark_rules_dirty()
+            self.save_config()
+        self.log('[CONFIG] 已{}全部规则'.format('启用' if enabled else '禁用'))
 
     # ---- 核心操作 ----
 
@@ -487,37 +671,69 @@ class MonitorEngine:
         except: return False
 
     def _open_chat(self, who):
-        """打开指定会话: 可见列表→翻页→搜索框"""
+        """打开指定会话: 当前页→会话列表点击→搜索框"""
         try:
+            if self._on_target(who):
+                self.status["current_chat"] = who
+                self.pinned_chats.add(who)
+                self.prepared_chats.add(who)
+                return True
+            if who in self.prepared_chats or who in self.pinned_chats:
+                if self._click_visible_cell(who):
+                    self._sleep_interruptible(0.08)
+                    if self._on_target(who):
+                        self.pinned_chats.add(who)
+                        self.prepared_chats.add(who)
+                        return True
+                    self.log('[CHAT] 会话列表点击后验证失败, 回退搜索: {}'.format(who[:20]))
             return self.__open_chat(who)
         except (LookupError, Exception) as e:
             self.log('[ERR] _open_chat失败: {}'.format(str(e)[:50]))
             return False
 
+    @staticmethod
+    def _session_cell_title(cell):
+        try:
+            return (cell.Name or '').split(chr(10))[0].strip()
+        except Exception:
+            return ''
 
     def _click_visible_cell(self, who):
         """在可见的 ChatSessionCell 中查找并点击目标聊天"""
-        win = FreshNav._try_uia()
-        if not win: return False
         cells = []
-        def rec(ele):
-            try:
-                if (ele.ControlTypeName == 'ListItemControl' and
-                    ele.ClassName and 'ChatSessionCell' in ele.ClassName):
-                    cells.append(ele)
-            except: pass
-            try:
-                for cc in ele.GetChildren():
-                    rec(cc)
-            except: pass
-        rec(win)
+        try:
+            table = FreshNav.get_session_table()
+            if table:
+                cells.extend(table.GetChildren())
+        except: pass
+
+        if not cells:
+            win = FreshNav._try_uia()
+            if not win: return False
+            def rec(ele):
+                try:
+                    if (ele.ControlTypeName == 'ListItemControl' and
+                        ele.ClassName and 'ChatSessionCell' in ele.ClassName):
+                        cells.append(ele)
+                except: pass
+                try:
+                    for cc in ele.GetChildren():
+                        rec(cc)
+                except: pass
+            rec(win)
+
+        target = who.strip()
         for c in cells:
             try:
-                if c.Name.split(chr(10))[0].strip() == who:
+                cls = c.ClassName or ''
+                if 'ChatSessionCell' not in cls and c.ControlTypeName != 'ListItemControl':
+                    continue
+                if self._session_cell_title(c) == target:
                     r = c.BoundingRectangle
                     mouse_click((r.left+r.right)//2, (r.top+r.bottom)//2)
-                    time.sleep(0.3)
+                    self._sleep_interruptible(0.12)
                     self.status["current_chat"] = who
+                    self.log('[CHAT] 已从会话列表切换: {}'.format(who[:20]))
                     return True
             except: pass
         return False
@@ -532,30 +748,34 @@ class MonitorEngine:
             if cur_name and cur_name.strip() == who.strip():
                 self.status["current_chat"] = who
                 self.pinned_chats.add(who)
+                self.prepared_chats.add(who)
                 return True
         except: pass
 
         for attempt in range(3):
             if attempt > 0:
                 self.log('[RETRY] 第{}次重试打开: {}'.format(attempt+1, who[:12]))
-                time.sleep(0.5)
+                self._sleep_interruptible(0.5)
 
-            focus_wechat(); time.sleep(0.08)
+            if self.stop_requested:
+                return False
+            focus_wechat(); self._sleep_interruptible(0.08)
 
             # Ctrl+F 搜索 + Enter 打开
             uia.SendKeys("{Ctrl}f", waitTime=0.1)
-            time.sleep(0.3)
+            self._sleep_interruptible(0.3)
             pyperclip.copy(who)
             uia.SendKeys("{Ctrl}v", waitTime=0.05)
-            time.sleep(0.35)
+            self._sleep_interruptible(0.35)
             uia.SendKeys("{Enter}", waitTime=0.05)
-            time.sleep(0.8)
+            self._sleep_interruptible(0.8)
 
             # 验证是否真的打开了
             try:
                 cur_name, _ = FreshNav.get_message_items()
                 if cur_name and cur_name.strip() == who.strip():
                     self.pinned_chats.add(who)
+                    self.prepared_chats.add(who)
                     self.status["current_chat"] = who
                     return True
             except: pass
@@ -587,7 +807,7 @@ class MonitorEngine:
                     time.sleep(0.08)
                     input_field.SendKeys('{Enter}', waitTime=0.03)
                     time.sleep(0.08)
-                    self.sent_texts.add(text.strip())
+                    self._remember_sent(text)
                     self.log('[SEND] 成功(UIA)')
                     return True
             except Exception as e:
@@ -607,16 +827,13 @@ class MonitorEngine:
         uia.SendKeys('{Enter}', waitTime=0.05)
         time.sleep(0.12)
 
-        self.sent_texts.add(text.strip())
+        self._remember_sent(text)
         self.log('[SEND] 成功')
         return True
 
     def _is_self(self, text):
         t = text.strip()
-        if t in self.sent_texts: return True
-        for s in self.sent_texts:
-            if s.strip() == t: return True
-        return False
+        return t in self.sent_texts
 
     @staticmethod
     def _normalize(t):
@@ -629,7 +846,31 @@ class MonitorEngine:
         m = MonitorEngine._normalize(msg_text)
         k = MonitorEngine._normalize(keyword)
         if not k: return False
-        return k in m or m == k
+        return k in m
+
+    def _prepare_rule_chats(self, grouped):
+        """多会话启动预热: 先逐个打开规则会话，使其进入会话列表前方。"""
+        chats = [chat for chat in grouped.keys() if chat.strip()]
+        if len(chats) <= 1:
+            return
+
+        self.log('[PREPARE] 检测到 {} 个规则会话, 开始预热会话列表'.format(len(chats)))
+        ok_count = 0
+        for i, chat in enumerate(chats, 1):
+            if self.stop_requested:
+                break
+            self.status['current_chat'] = '预热 {}/{} {}'.format(i, len(chats), chat[:12])
+            self.log('[PREPARE] ({}/{}) 打开会话: {}'.format(i, len(chats), chat[:20]))
+            if self.__open_chat(chat):
+                ok_count += 1
+                self.prepared_chats.add(chat)
+                self.pinned_chats.add(chat)
+                self._sleep_interruptible(0.12)
+            else:
+                self.log('[PREPARE] 会话预热失败: {}'.format(chat[:20]))
+
+        self.log('[PREPARE] 会话预热完成: {}/{}，后续优先从会话列表点击切换'.format(
+            ok_count, len(chats)))
 
     # ---- 运行入口 ----
 
@@ -646,15 +887,19 @@ class MonitorEngine:
         self.baseline_ids.clear()
         self.last_incoming.clear()
         self.pinned_chats.clear()  # 重新开始时清空
+        self.prepared_chats.clear()
         self.sent_texts.clear()
+        self.sent_text_order.clear()
         self.stop_requested = False
         self.status = {
             'mode': '循环检测' if self.mode=='loop' else '检测一次',
             'current_chat': '', 'last_message': '',
             'last_trigger': '', 'last_send': '',
             'round': 0, 'total_rounds': 0,
+            'sent_ok': 0, 'sent_fail': 0, 'last_record_time': '',
         }
         self.monitor_running = True
+        self._start_hotkey_watcher()
         self._thread = threading.Thread(target=self._runner, daemon=True)
         self._thread.start()
 
@@ -663,7 +908,7 @@ class MonitorEngine:
             try:
                 _stop_self = self.stop
                 MonitorEngine._hotkey_hkid = GlobalHotkey.register(
-                    MOD_CONTROL | MOD_SHIFT, 0x43,  # VK_C
+                    MOD_CONTROL | MOD_SHIFT, VK_C,
                     lambda: _stop_self())
                 self.log('[HOTKEY] Ctrl+Shift+C 全局强制停止已注册')
             except Exception as e:
@@ -679,17 +924,18 @@ class MonitorEngine:
         if self.mode == 'loop':
             self.log('[START] 模式: 循环 | 激活{}秒/暂停{}秒 | 间隔{}秒 | 规则: {}条'.format(
                 self.active_duration, self.pause_duration, self.poll_interval,
-                sum(1 for r in self.rules if r.enabled)))
+                self.enabled_rule_count()))
         else:
             self.log('[START] 模式: 单次 | 规则: {}条'.format(
-                sum(1 for r in self.rules if r.enabled)))
+                self.enabled_rule_count()))
         return True
 
     def stop(self):
         self.stop_requested = True
+        self._hotkey_stop_event.set()
         if not self.monitor_running: return
         self.monitor_running = False
-        if self._thread:
+        if self._thread and threading.current_thread() is not self._thread:
             self._thread.join(timeout=5)
         self.log('[STOP] 监控已停止 (完成{}轮)'.format(self.status['round']))
 
@@ -703,20 +949,26 @@ class MonitorEngine:
         self._validate_mode()
         self.log('[RUN] {}模式启动'.format('循环' if self.mode=='loop' else '单次'))
         t0 = time.time()
+        groups, enabled, _ = self._get_rule_groups()
+        if enabled:
+            self._prepare_rule_chats(groups)
 
-        if self.mode == 'once':
+        if self.stop_requested:
+            pass
+        elif self.mode == 'once':
             self._poll_once()
         else:
             self._loop_forever(t0)
 
         self.monitor_running = False
+        self._hotkey_stop_event.set()
         elapsed = int(time.time() - t0)
         self.log('[END] 运行结束，耗时 {} 秒，共 {} 轮'.format(elapsed, self.status['round']))
 
     def _poll_once(self):
         """循环检测直到匹配并回复一次, 然后停止"""
-        rules = [r for r in self.rules if r.enabled]
-        if not rules:
+        _, enabled, _ = self._get_rule_groups()
+        if not enabled:
             self.log('[SKIP] 没有启用的规则')
             return
         self.log('[ONCE] 等待匹配消息, 检测到后回复一次并停止')
@@ -724,13 +976,16 @@ class MonitorEngine:
         while not self.stop_requested:
             self.status['round'] += 1
             try:
-                self._poll_all_rules(rules, is_once=True)
-                if self.status.get('last_send') == '成功':
+                groups, enabled, rules_version = self._get_rule_groups()
+                if not enabled:
+                    self.log('[SKIP] 没有启用的规则')
+                    break
+                if self._poll_all_rules(groups, is_once=True, rules_version=rules_version):
                     self.log('[ONCE] 已回复, 停止检测')
                     break
             except Exception as e:
                 self.log('[ERR] 本轮异常: {}'.format(str(e)[:60]))
-            time.sleep(self.poll_interval)
+            self._sleep_interruptible(self.poll_interval)
 
     def _loop_forever(self, start_time):
         """循环检测: 激活N秒 → 暂停N秒 → 重复，直到手动停止"""
@@ -741,7 +996,6 @@ class MonitorEngine:
         cycle = 0
         while not self.stop_requested:
             cycle += 1
-            rules = [r for r in self.rules if r.enabled]
 
             # ==== 激活阶段 ====
             phase_start = time.time()
@@ -751,34 +1005,27 @@ class MonitorEngine:
                 elapsed = time.time() - phase_start
                 if elapsed >= active_dur: break
 
-                if not rules:
-                    time.sleep(0.3)
+                groups, enabled, rules_version = self._get_rule_groups()
+                if not enabled:
+                    self._sleep_interruptible(0.3)
                     continue
 
                 try:
                     self.status['round'] += 1
                     self.status['total_rounds'] = '-'
-                    self._poll_all_rules(rules, is_once=False)
-                    time.sleep(max(self.poll_interval, 0.1))
+                    self._poll_all_rules(groups, is_once=False, rules_version=rules_version)
+                    self._sleep_interruptible(max(self.poll_interval, 0.1))
                 except (LookupError, Exception) as e:
                     self.log('[ERR] 本轮异常: {}'.format(str(e)[:60]))
-                    time.sleep(1)
+                    self._sleep_interruptible(1)
 
             # ==== 暂停阶段 ====
             if pause_dur > 0 and not self.stop_requested:
                 self.log('[LOOP] 周期#{} 暂停{}秒'.format(cycle, pause_dur))
-                # 分小段sleep, 以便能响应stop
-                slept = 0
-                while slept < pause_dur and not self.stop_requested:
-                    time.sleep(1)
-                    slept += 1
+                self._sleep_interruptible(pause_dur, step=0.2)
 
-    def _poll_all_rules(self, rules, is_once):
+    def _poll_all_rules(self, grouped, is_once, rules_version):
         """按聊天分组检测"""
-        grouped = {}
-        for idx, rule in enumerate(rules):
-            grouped.setdefault(rule.chat, []).append((idx, rule))
-
         single = (len(grouped) == 1)
 
         for chat, rule_list in grouped.items():
@@ -786,9 +1033,11 @@ class MonitorEngine:
 
             # 1. 确保在目标聊天
             need_open = True
-            if not is_once and single and chat in self.pinned_chats:
-                # 循环+单聊天+已打开: 静默读, 不切屏
-                if self._on_target(chat):
+            cur_name, items = None, []
+            if single and chat in self.pinned_chats:
+                # 单聊天已定位时直接读当前页面，避免每轮重复搜索和二次 UIA 读取。
+                cur_name, items = FreshNav.get_message_items()
+                if cur_name and cur_name.strip() == chat.strip():
                     need_open = False
                 else:
                     self.pinned_chats.discard(chat)
@@ -796,16 +1045,20 @@ class MonitorEngine:
                 if not self._open_chat(chat):
                     self.log('[SKIP] 规则#{} 无法打开: {}'.format(rule_list[0][0]+1, chat))
                     continue
-                time.sleep(0.1)
+                self._sleep_interruptible(0.05)
+                cur_name, items = FreshNav.get_message_items()
 
             # 2. 取最后一条 incoming 消息
-            cur_name, items = FreshNav.get_message_items()
             if not cur_name or cur_name.strip() != chat.strip():
                 self.log('[SKIP] 聊天不匹配: 期望[{}] 实际[{}]'.format(chat, cur_name))
                 continue
 
             latest = None
-            for item in reversed(list(items)):
+            try:
+                item_iter = reversed(items)
+            except TypeError:
+                item_iter = reversed(list(items))
+            for item in item_iter:
                 msg = RawMsg(item)
                 if msg.is_timestamp or not msg.name.strip():
                     continue
@@ -817,17 +1070,19 @@ class MonitorEngine:
             full = latest.name
             sender = ''
             content = full
-            if '\n' in full and len(full.split('\n')[0]) < 30:
-                parts = full.split('\n', 1)
-                sender = parts[0]
-                content = parts[1] if len(parts) > 1 else full
+            if '\n' in full:
+                head, body = full.split('\n', 1)
+                if len(head) < 30:
+                    sender = head
+                    content = body
 
-            is_self = self._is_self(full)
+            is_self = self._is_self(full) or self._is_self(content)
             self.status['current_chat'] = chat
             self.status['last_message'] = content[:60]
 
             # 3. 去重: 和上次相同则跳过
-            dedup_key = '{}|{}|{}'.format(chat, sender, content.strip())
+            msg_key = latest.runtime_id or latest.content_hash
+            dedup_key = '{}|{}|{}|{}'.format(rules_version, msg_key, sender, content.strip())
             if dedup_key == self.last_incoming.get(chat, ''):
                 continue
             self.last_incoming[chat] = dedup_key
@@ -837,40 +1092,48 @@ class MonitorEngine:
                 continue
 
             # 5. 逐条规则匹配
-            for idx, rule in rule_list:
-                if not self._match_kw(content, rule.keyword):
-                    continue
-                if not rule.reply.strip():
+            normalized_content = self._normalize(content)
+            for idx, rule, keyword_norm in rule_list:
+                if keyword_norm not in normalized_content:
                     continue
                 if rule.reply.strip() in full:
                     continue
 
                 self.log('[KEYWORD] 触发! [{}] kw={!r}'.format(chat, rule.keyword))
                 ok = self._send_reply(rule.reply)
+                self._record_reply(idx, rule, chat, sender, content, ok)
                 if ok:
                     self.log('[REPLY] -> [{}]: {}'.format(chat, rule.reply[:40]))
                     self.status['last_trigger'] = '{} | {}'.format(chat, rule.keyword)
                     self.status['last_send'] = '成功'
                 else:
                     self.status['last_send'] = '失败'
-                break  # 每条消息只回复一次
+                return ok  # 每条消息只尝试回复一次；单次模式仅成功后结束
+        return False
 
 
 # ==================== Tkinter UI ====================
 
 class AutoReplyUI:
 
-    C = {'bg':'#F5F7FA','card':'#FFFFFF','header':'#24292E',
-         'primary':'#07C160','primary_hov':'#06AD56','blue':'#1677FF',
-         'blue_hov':'#4096FF','danger':'#F5222D','danger_hov':'#FF4D4F',
-         'warning':'#FAAD14','text':'#1F2937','text2':'#6B7280',
-         'border':'#E5E7EB','row_even':'#FAFBFC','row_hover':'#E8F5E9',}
+    C = {'bg':'#F3F6FB','card':'#FFFFFF','header':'#173B3F',
+         'header_sub':'#BFE7E3','primary':'#10B981','primary_hov':'#059669',
+         'blue':'#2563EB','blue_hov':'#3B82F6','cyan':'#0891B2',
+         'danger':'#EF4444','danger_hov':'#F87171','warning':'#F59E0B',
+         'purple':'#7C3AED','pink':'#DB2777','text':'#172033',
+         'text2':'#667085','border':'#D8E0EA','row_even':'#F8FAFC',
+         'row_hover':'#DFF7EA','soft_green':'#ECFDF5','soft_blue':'#EFF6FF',
+         'soft_yellow':'#FFFBEB','soft_red':'#FEF2F2',}
 
     def __init__(self, engine):
         self.engine = engine
         engine.load_config()
         self.root = None
         self.log_text = None
+        self.records_tree = None
+        self.header_rules = None
+        self._records_seen_version = -1
+        self._pulse_on = False
 
     def _btn(self, parent, text, cmd, color, hcolor, w=9, fs=10):
         tk = self.tk; c=self.C.get(color,color); hc=self.C.get(hcolor,hcolor)
@@ -906,6 +1169,7 @@ class AutoReplyUI:
         if title:
             h = tk.Frame(inner, bg=self.C['card'], height=26); h.pack(fill=tk.X, pady=(0,5))
             h.pack_propagate(False)
+            tk.Frame(h, bg=self.C['primary'], width=4).pack(side=tk.LEFT, fill=tk.Y, padx=(0, 7))
             tk.Label(h, text=title, bg=self.C['card'], fg=self.C['text'],
                      font=('Microsoft YaHei UI', 10, 'bold')).pack(side=tk.LEFT)
             tk.Frame(h, bg=self.C['border'], height=1).pack(side=tk.BOTTOM, fill=tk.X)
@@ -968,10 +1232,13 @@ class AutoReplyUI:
         tk.Label(hdr, text='wxauto 自动回复监控', bg=self.C['header'], fg='white',
                  font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT)
         tk.Label(hdr, text='微信消息关键词自动回复工具', bg=self.C['header'],
-                 fg='#9CA3AF', font=('Microsoft YaHei UI', 9)).pack(side=tk.LEFT, padx=12)
+                 fg=self.C['header_sub'], font=('Microsoft YaHei UI', 9)).pack(side=tk.LEFT, padx=12)
         self.header_badge = tk.Label(hdr, text='已停止', bg=self.C['danger'], fg='white',
                                      font=('Microsoft YaHei UI', 9, 'bold'), padx=10, pady=2)
         self.header_badge.pack(side=tk.RIGHT)
+        self.header_rules = tk.Label(hdr, text='0 条启用规则', bg='#245D63', fg='white',
+                                     font=('Microsoft YaHei UI', 9, 'bold'), padx=10, pady=2)
+        self.header_rules.pack(side=tk.RIGHT, padx=8)
 
         # ========== PARAMS CARD ==========
         pc_out, pc = self._card(self.root)
@@ -1026,6 +1293,8 @@ class AutoReplyUI:
         self.rules_tree.heading('chat', text='聊天对象'); self.rules_tree.column('chat', width=110)
         self.rules_tree.heading('keyword', text='关键词'); self.rules_tree.column('keyword', width=75)
         self.rules_tree.heading('reply', text='回复内容'); self.rules_tree.column('reply', width=130)
+        self.rules_tree.tag_configure('on', background=self.C['soft_green'])
+        self.rules_tree.tag_configure('off', background=self.C['row_even'])
         self.rules_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.rules_tree.bind('<<TreeviewSelect>>', self._on_tree_select)
         sb = tk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.rules_tree.yview,
@@ -1040,7 +1309,8 @@ class AutoReplyUI:
         s_out, sc = self._card(lc, '运行状态'); s_out.pack(fill=tk.X, pady=(8, 0))
         self.status_labels = {}
         for key, label in [('monitor','监控状态'),('mode','运行模式'),('current_chat','当前聊天'),
-                           ('last_message','最后检测消息'),('last_trigger','最后触发'),('last_send','最后发送')]:
+                           ('last_message','最后检测消息'),('last_trigger','最后触发'),('last_send','最后发送'),
+                           ('sent_ok','成功回复'),('sent_fail','失败回复'),('last_record_time','最后记录')]:
             row = tk.Frame(sc, bg=self.C['card']); row.pack(fill=tk.X, pady=2)
             tk.Label(row, text=label+':', bg=self.C['card'], fg=self.C['text2'],
                      font=('Microsoft YaHei UI', 8, 'bold'), width=12, anchor='e').pack(side=tk.LEFT)
@@ -1083,12 +1353,19 @@ class AutoReplyUI:
         self.round_label.pack(side=tk.LEFT, padx=10)
         self._update_start_button()
 
-        # Log
-        _, lgc = self._card(bottom, '运行日志'); lgc.pack(fill=tk.BOTH, expand=True)
-        lbf = tk.Frame(lgc, bg=self.C['card']); lbf.pack(fill=tk.X, pady=(0, 4))
+        # Log + records
+        _, lgc = self._card(bottom, '运行日志 / 回复记录'); lgc.pack(fill=tk.BOTH, expand=True)
+        self.history_tabs = self.ttk.Notebook(lgc)
+        self.history_tabs.pack(fill=tk.BOTH, expand=True)
+        log_tab = tk.Frame(self.history_tabs, bg=self.C['card'])
+        records_tab = tk.Frame(self.history_tabs, bg=self.C['card'])
+        self.history_tabs.add(log_tab, text='运行日志')
+        self.history_tabs.add(records_tab, text='回复记录')
+
+        lbf = tk.Frame(log_tab, bg=self.C['card']); lbf.pack(fill=tk.X, pady=(0, 4))
         self._bsm(lbf, '清空日志', lambda: self.log_text.delete('1.0', tk.END) if self.log_text else None, 'text2', 'text2').pack(side=tk.LEFT, padx=1)
-        self._bsm(lbf, '复制日志', lambda: None, 'blue', 'blue_hov').pack(side=tk.LEFT, padx=3)
-        ltf = tk.Frame(lgc, bg=self.C['border'], padx=1, pady=1); ltf.pack(fill=tk.BOTH, expand=True)
+        self._bsm(lbf, '复制日志', self._copy_log, 'blue', 'blue_hov').pack(side=tk.LEFT, padx=3)
+        ltf = tk.Frame(log_tab, bg=self.C['border'], padx=1, pady=1); ltf.pack(fill=tk.BOTH, expand=True)
         self.log_text = self.scrolledtext.ScrolledText(
             ltf, font=('Cascadia Mono', 9), relief=tk.FLAT, bd=0,
             wrap=tk.WORD, bg='#1A1E2B', fg='#D4D4D8', insertbackground='white')
@@ -1097,14 +1374,87 @@ class AutoReplyUI:
                      ('info','#60A5FA'),('skip','#9CA3AF'),('poll','#A78BFA')]:
             self.log_text.tag_configure(t, foreground=c)
 
+        rbf = tk.Frame(records_tab, bg=self.C['card']); rbf.pack(fill=tk.X, pady=(0, 4))
+        self._bsm(rbf, '刷新记录', self._refresh_records_tree, 'primary', 'primary_hov').pack(side=tk.LEFT, padx=1)
+        self._bsm(rbf, '复制选中', self._copy_selected_record, 'blue', 'blue_hov').pack(side=tk.LEFT, padx=3)
+        self._bsm(rbf, '清空记录', self._clear_records, 'danger', 'danger_hov').pack(side=tk.LEFT, padx=3)
+        rtf = tk.Frame(records_tab, bg=self.C['border'], padx=1, pady=1); rtf.pack(fill=tk.BOTH, expand=True)
+        record_cols = ('time', 'chat', 'rule', 'keyword', 'reply', 'status')
+        self.records_tree = tk.ttk.Treeview(rtf, columns=record_cols, show='headings',
+                                            height=7, selectmode='browse', style='R.Treeview')
+        widths = {'time':125, 'chat':135, 'rule':60, 'keyword':110, 'reply':280, 'status':70}
+        labels = {'time':'回复时间', 'chat':'聊天对象', 'rule':'规则', 'keyword':'关键词',
+                  'reply':'回复内容', 'status':'状态'}
+        for col in record_cols:
+            self.records_tree.heading(col, text=labels[col])
+            self.records_tree.column(col, width=widths[col], anchor='center' if col in ('rule','status') else 'w')
+        self.records_tree.tag_configure('ok', background=self.C['soft_green'])
+        self.records_tree.tag_configure('fail', background=self.C['soft_red'])
+        self.records_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rsb = tk.Scrollbar(rtf, orient=tk.VERTICAL, command=self.records_tree.yview,
+                           bg=self.C['card'])
+        self.records_tree.configure(yscrollcommand=rsb.set)
+        rsb.pack(side=tk.RIGHT, fill=tk.Y)
+
     # ===== UI 逻辑 =====
+
+    def _copy_log(self):
+        if not self.log_text:
+            return
+        text = self.log_text.get('1.0', self.tk.END).strip()
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.engine.log('[UI] 已复制运行日志')
+
+    def _refresh_records_tree(self):
+        if not self.records_tree:
+            return
+        children = self.records_tree.get_children()
+        if children:
+            self.records_tree.delete(*children)
+        records = self.engine.load_reply_records(limit=200)
+        for i, rec in enumerate(records):
+            ok = bool(rec.get('success'))
+            tag = 'ok' if ok else 'fail'
+            t = rec.get('time', '')
+            if 'T' in t:
+                t = t.replace('T', ' ')
+            self.records_tree.insert('', self.tk.END, iid='rec{}'.format(i),
+                                     values=(t, rec.get('chat', ''),
+                                             '#{}'.format(rec.get('rule_index', '')),
+                                             rec.get('keyword', ''),
+                                             rec.get('reply', ''),
+                                             '成功' if ok else '失败'),
+                                     tags=(tag,))
+        self._records_seen_version = self.engine.records_version
+
+    def _copy_selected_record(self):
+        if not self.records_tree:
+            return
+        sel = self.records_tree.selection()
+        if not sel:
+            self.messagebox.showinfo('提示', '请先选择一条回复记录')
+            return
+        vals = self.records_tree.item(sel[0], 'values')
+        text = '时间: {}\n聊天对象: {}\n规则: {}\n关键词: {}\n回复内容: {}\n状态: {}'.format(*vals)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.engine.log('[UI] 已复制选中回复记录')
+
+    def _clear_records(self):
+        if self.messagebox.askyesno('确认', '清空所有回复记录?'):
+            if self.engine.clear_reply_records():
+                self._refresh_records_tree()
 
     def _append_log(self, msg):
         if not self.log_text: return
         for kw, tag in [('[KEYWORD]','trigger'),('[REPLY]','reply'),('[SEND]','reply'),
                         ('失败','error'),('异常','error'),
                         ('[START]','info'),('[STOP]','info'),('[LOOP]','info'),
-                        ('[END]','info'),('[RUN]','info'),
+                        ('[END]','info'),('[RUN]','info'),('[MODE]','info'),
+                        ('[CONFIG]','info'),('[UI]','info'),('[RECORD]','info'),
                         ('[SKIP]','skip'),('[POLL]','poll'),('[MATCH]','poll'),
                         ('[DEDUP]','poll'),('[CHAT]','poll'),('[ROUND]','poll'),
                         ('[BASELINE]','poll')]:
@@ -1116,14 +1466,18 @@ class AutoReplyUI:
         self.log_text.see(self.tk.END)
 
     def _refresh_rules_tree(self):
-        self.rules_tree.delete(*self.rules_tree.get_children())
+        children = self.rules_tree.get_children()
+        if children:
+            self.rules_tree.delete(*children)
         for i, r in enumerate(self.engine.rules):
             status = '[ON]' if r.enabled else '[OFF]'
             self.rules_tree.insert('', self.tk.END, iid=str(i),
-                                   values=(status, r.chat, r.keyword, r.reply))
+                                   values=(status, r.chat, r.keyword, r.reply),
+                                   tags=('on' if r.enabled else 'off',))
 
     def _refresh_all(self):
         self._refresh_rules_tree()
+        self._refresh_records_tree()
         self.mode_var.set(self.engine.mode)
         self.entry_active.delete(0, self.tk.END)
         self.entry_active.insert(0, str(self.engine.active_duration))
@@ -1149,13 +1503,15 @@ class AutoReplyUI:
         self.led.pack_forget()
         self.round_label.pack_forget()
 
-        # 只显示当前模式的启动按钮
-        if self.engine.mode == 'loop':
-            self.btn_start_loop.pack(side=self.tk.LEFT, padx=3)
+        # 只显示当前状态下需要的操作
+        if self.engine.monitor_running:
+            self.btn_stop.pack(side=self.tk.LEFT, padx=3)
         else:
-            self.btn_start_once.pack(side=self.tk.LEFT, padx=3)
+            if self.engine.mode == 'loop':
+                self.btn_start_loop.pack(side=self.tk.LEFT, padx=3)
+            else:
+                self.btn_start_once.pack(side=self.tk.LEFT, padx=3)
 
-        self.btn_stop.pack(side=self.tk.LEFT, padx=3)
         self.led.pack(side=self.tk.LEFT, padx=15)
         self.round_label.pack(side=self.tk.LEFT, padx=10)
 
@@ -1173,23 +1529,24 @@ class AutoReplyUI:
             self.engine.active_duration = a
         except:
             self.messagebox.showwarning('错误', '激活时长必须是 >=1 的整数')
-            return
+            return False
         try:
             p = int(self.entry_pause.get().strip())
             if p < 0: raise ValueError
             self.engine.pause_duration = p
         except:
             self.messagebox.showwarning('错误', '暂停时长必须是 >=0 的整数')
-            return
+            return False
         try:
             v = float(self.entry_interval.get().strip())
             if v < 0: raise ValueError
             self.engine.poll_interval = v
         except:
             self.messagebox.showwarning('错误', '间隔必须是 >=0 的数字')
-            return
+            return False
         self.engine.save_config()
         self.engine.log('[CONFIG] 激活{}秒/暂停{}秒 间隔{}秒'.format(a, p, v))
+        return True
 
     def _on_tree_select(self, event):
         sel = self.rules_tree.selection()
@@ -1224,10 +1581,9 @@ class AutoReplyUI:
         r = self.text_reply.get('1.0', self.tk.END).strip()
         if not c or not k or not r:
             self.messagebox.showwarning('提示', '聊天对象、关键词、回复内容不能为空'); return
-        with self.engine._lock:
-            self.engine.rules[idx].chat = c; self.engine.rules[idx].keyword = k; self.engine.rules[idx].reply = r
-        self.engine.save_config(); self._refresh_rules_tree(); self._clear_form()
-        self.engine.log('更新规则#{}: {} | {}'.format(idx+1, c, k))
+        if self.engine.update_rule(idx, c, k, r):
+            self._refresh_rules_tree()
+            self._clear_form()
 
     def _del_rule(self):
         sel = self.rules_tree.selection()
@@ -1250,8 +1606,7 @@ class AutoReplyUI:
         self._refresh_rules_tree()
 
     def _all_toggle(self, enabled):
-        for i in range(len(self.engine.rules)):
-            self.engine.toggle_rule(i, enabled)
+        self.engine.set_all_rules(enabled)
         self._refresh_rules_tree()
         self._update_hint()
 
@@ -1260,7 +1615,8 @@ class AutoReplyUI:
             self._set_ui_running()
 
     def _start_loop(self):
-        self._apply_loop_params()  # 先应用参数
+        if not self._apply_loop_params():  # 先应用参数
+            return
         if self.engine.start(mode='loop'):
             self._set_ui_running()
 
@@ -1349,29 +1705,37 @@ class AutoReplyUI:
     def _update_status(self):
         st = self.engine.status; labels = self.status_labels
         running = self.engine.monitor_running
+        enabled = self.engine.enabled_rule_count()
+        if self.header_rules:
+            self.header_rules.config(text='{} 条启用规则'.format(enabled))
         labels['monitor'].config(text='运行中' if running else '已停止',
                                  fg=self.C['primary'] if running else self.C['danger'])
         self.header_badge.config(text='运行中' if running else '已停止',
                                  bg=self.C['primary'] if running else self.C['danger'])
-        self.led.config(text='O 运行中' if running else 'O 已停止',
-                        fg=self.C['primary'] if running else self.C['danger'])
+        self._pulse_on = not self._pulse_on if running else False
+        led_color = self.C['primary'] if self._pulse_on else self.C['cyan']
+        self.led.config(text='● 运行中' if running else '● 已停止',
+                        fg=led_color if running else self.C['danger'])
         labels['mode'].config(text=st.get('mode','-'))
         labels['current_chat'].config(text=(st.get('current_chat','-') or '-')[:25])
         labels['last_message'].config(text=(st.get('last_message','-') or '-')[:30])
         labels['last_trigger'].config(text=(st.get('last_trigger','-') or '-')[:30])
         labels['last_send'].config(text=(st.get('last_send','-') or '-')[:20])
+        labels['sent_ok'].config(text=str(st.get('sent_ok', 0)), fg=self.C['primary'])
+        labels['sent_fail'].config(text=str(st.get('sent_fail', 0)), fg=self.C['danger'])
+        labels['last_record_time'].config(text=st.get('last_record_time', '') or '-')
         rn = st.get('round',0); total = st.get('total_rounds',0)
         if running and total == '-': self.round_label.config(text='第 {} 轮'.format(rn))
         elif running: self.round_label.config(text='第 {}/{} 轮'.format(rn, total))
         else: self.round_label.config(text='')
-        if not running: self._set_ui_stopped()
+        self._update_start_button()
         self._update_hint()
         try: GlobalHotkey.pump_once()  # 主线程处理全局热键
         except: pass
         self.root.after(1000, self._update_status)
 
     def _update_hint(self):
-        enabled = sum(1 for r in self.engine.rules if r.enabled)
+        enabled = self.engine.enabled_rule_count()
         running = self.engine.monitor_running
         if enabled and not running:
             self.hint_label.config(text='已配置 {} 条规则，点击启动按钮开始'.format(enabled))
@@ -1387,6 +1751,8 @@ class AutoReplyUI:
         try:
             while True: self._append_log(self.engine.log_queue.get_nowait())
         except queue.Empty: pass
+        if self.records_tree and self._records_seen_version != self.engine.records_version:
+            self._refresh_records_tree()
         try: GlobalHotkey.pump_once()  # 高频检查热键(300ms)
         except: pass
         self.root.after(300, self._pull_logs)
